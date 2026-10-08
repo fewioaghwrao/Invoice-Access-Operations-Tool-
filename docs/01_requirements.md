@@ -24,30 +24,46 @@ Invoice Management System を正データの管理主体とし、本ツールは
 # 2. システム構成
 
 ```text
-Invoice Management System
-        │
-        │ CSV Export
-        ▼
-┌───────────────────────┐
-│ invoices_YYYYMM.csv   │
-│ payments_YYYYMM.csv   │
-│ allocations_YYYYMM.csv│
-└───────────┬───────────┘
-            │
-            ▼
- Microsoft Access
-            │
-            ├─ CSV取込
-            ├─ 請求照合
-            ├─ 入金照合
-            ├─ 不整合チェック
-            ├─ 月次集計
-            └─ 確認レポート
+Microsoft Access
+    │
+    │ F_Login
+    │ POST /auth/login
+    ▼
+Invoice Management System API
+    │
+    │ JWT Bearer
+    ▼
+F_CsvImport
+    │
+    │ 対象年 / 対象月
+    │ GET /api/admin/access-export
+    ▼
+invoice-access-YYYYMM.zip
+    │
+    ├─ invoices_YYYYMM.csv
+    ├─ payments_YYYYMM.csv
+    └─ allocations_YYYYMM.csv
+    │
+    ▼
+Microsoft Access
+    │
+    ├─ ZIP展開
+    ├─ CSV取込
+    ├─ 対象月抽出
+    ├─ 請求照合
+    ├─ 入金照合
+    ├─ 不整合チェック
+    ├─ 月次集計
+    └─ 月次確認レポート
 ```
+
+Invoice Management System を正データの管理主体とする。
 
 AccessからInvoice Management SystemのDBを直接更新しない。
 
-CSVを介した一方向連携とする。
+API / CSVを介した一方向連携とし、Access側からInvoice本体への登録・更新・削除は行わない。
+
+APIを利用できない場合に備え、3CSVを利用者が個別指定して取り込む手動経路も残す。
 
 ---
 
@@ -57,20 +73,31 @@ CSVを介した一方向連携とする。
 
 Phase 1では以下を実装対象とする。
 
-1. 請求CSV取込
-2. 入金CSV取込
-3. 入金割当CSV取込
-4. CSV基本形式チェック
-5. 請求額と割当額の照合
-6. 入金額と割当額の照合
-7. 未入金抽出
-8. 一部入金抽出
-9. 過剰割当抽出
-10. 未割当入金抽出
-11. 入金額超過割当の検出
-12. 月次集計
-13. 確認結果一覧表示
-14. 月次確認レポート表示
+1. Invoice APIへの管理者ログイン
+2. JWTのAccess実行中保持
+3. 対象年月の指定
+4. Access Export APIの呼出
+5. ZIPダウンロード
+6. ZIP自動展開
+7. 請求CSV取込
+8. 入金CSV取込
+9. 入金割当CSV取込
+10. CSV基本形式チェック
+11. 請求額と割当額の照合
+12. 入金額と割当額の照合
+13. 未入金抽出
+14. 一部入金抽出
+15. 過剰割当抽出
+16. 未割当入金抽出
+17. 入金額超過割当の検出
+18. ステータス不整合確認
+19. キャンセル済み請求への割当確認
+20. 期限超過状態不整合確認
+21. 参照不整合確認
+22. 対象月の請求・入金集計
+23. 確認結果一覧表示
+24. 月次確認レポート表示
+25. APIを利用しない手動CSV取込
 
 ## 3.2 Phase 1 対象外
 
@@ -86,8 +113,9 @@ Phase 1では以下を実装対象とする。
 - Invoice DBへの直接接続
 - Excel帳票の高度な自動生成
 - 旧システムからの移行データ変換
-- 過去時点のデータ状態復元
+- 過去時点のデータ状態完全復元
 - 複数ユーザーによる同時更新
+- CSV取込履歴の世代管理
 
 ---
 
@@ -106,14 +134,46 @@ allocations_YYYYMM.csv
 例：
 
 ```text
-invoices_202609.csv
-payments_202609.csv
-allocations_202609.csv
+invoices_202702.csv
+payments_202702.csv
+allocations_202702.csv
 ```
 
-3ファイルは同一の基準日時で作成されたデータセットとして扱う。
+3ファイルは同一のAccess Export要求で生成し、1つのZIPに格納する。
+
+```text
+invoice-access-YYYYMM.zip
+```
 
 Access側では3ファイルを同一取込単位として処理する。
+
+## 4.2 API自動連携
+
+通常経路は以下とする。
+
+```text
+F_Login
+    ↓ POST /auth/login
+Admin JWT取得
+    ↓
+F_CsvImport
+    ↓ 対象年月指定
+GET /api/admin/access-export
+    ↓
+ZIP取得
+    ↓
+ZIP展開
+    ↓
+3CSV取込
+```
+
+Access Export APIはAdminユーザーのみ実行可能とする。
+
+## 4.3 手動取込
+
+APIが利用できない場合、または検証用CSVを使用する場合は、利用者が3CSVを個別指定して取り込めること。
+
+自動連携と手動取込のどちらでも、最終的には同じImport Tableと照合Queryを使用する。
 
 ---
 
@@ -478,14 +538,31 @@ T_PaymentImport.PaymentId
 | 項目 | 内容 |
 |---|---|
 | 請求件数 | 対象月に発生した請求件数 |
-| 請求金額 | 対象月のTotalAmount合計 |
+| 請求金額 | 対象月に発生した請求のTotalAmount合計。CANCELLEDは金額集計から除外 |
 | 入金件数 | 対象月に発生した入金件数 |
 | 入金金額 | 対象月のPayment.Amount合計 |
-| 未入金件数 | 未入金と判定された請求件数 |
-| 一部入金件数 | 一部入金と判定された請求件数 |
+| 未入金件数 | 取込スナップショット上で未入金と判定された請求件数 |
+| 一部入金件数 | 取込スナップショット上で一部入金と判定された請求件数 |
 | 過剰割当件数 | 請求額より割当額が多い件数 |
 | 未割当入金件数 | 入金額の全額が割当されていない件数 |
 | 割当額超過件数 | 入金額より割当額が多い件数 |
+| ステータス不整合件数 | Invoice本体状態とAccess再計算状態の不整合件数 |
+| キャンセル請求割当件数 | CANCELLED請求に割当が存在する件数 |
+| 期限超過状態不整合件数 | 対象年月基準の期限超過判定とInvoice本体状態の不整合件数 |
+| 参照不整合件数 | 存在しないInvoice / Paymentを参照するAllocation件数 |
+
+基本集計の対象年月は、`F_CsvImport` で指定した `TargetYear` / `TargetMonth` を使用する。
+
+```text
+F_CsvImport
+    ↓
+TempVars(TargetYear / TargetMonth)
+    ↓
+Q_TargetMonthInvoices
+Q_TargetMonthPayments
+    ↓
+Q_MonthlySummary
+```
 
 月次売上や会計上の正式な締め金額を確定する機能ではなく、月次確認用の集計とする。
 
@@ -493,50 +570,64 @@ T_PaymentImport.PaymentId
 
 # 16. Accessクエリ
 
-Phase 1では以下のクエリを作成する。
+Phase 1では以下のクエリを使用する。
+
+| Query | 用途 |
+|---|---|
+| `Q_InvoiceAllocationSummary` | 請求単位の割当額集計 |
+| `Q_PaymentAllocationSummary` | 入金単位の割当額集計 |
+| `Q_UnpaidInvoices` | 未入金請求 |
+| `Q_PartiallyPaidInvoices` | 一部入金請求 |
+| `Q_OverAllocatedInvoices` | 請求額超過割当 |
+| `Q_UnallocatedPayments` | 未割当・一部未割当入金 |
+| `Q_PaymentOverAllocation` | 入金額超過割当 |
+| `Q_OrphanAllocations` | 存在しない請求・入金への割当 |
+| `Q_StatusMismatch` | Invoice本体ステータスとの不整合 |
+| `Q_CancelledWithAllocation` | キャンセル済み請求への割当 |
+| `Q_PastDueMismatch` | 期限超過状態の不整合 |
+| `Q_TargetMonthInvoices` | 指定対象月に発生したInvoice抽出 |
+| `Q_TargetMonthPayments` | 指定対象月に発生したPayment抽出 |
+| `Q_CheckResult` | 主な確認対象を一覧表示用に正規化 |
+| `Q_MonthlySummary` | 対象月基本集計と照合件数の月次サマリー |
+
+`Q_CheckResult` は主に以下を一覧化する。
 
 ```text
-Q_InvoiceAllocationSummary
-    請求単位の割当額集計
-
-Q_PaymentAllocationSummary
-    入金単位の割当額集計
-
-Q_UnpaidInvoices
-    未入金請求
-
-Q_PartiallyPaidInvoices
-    一部入金請求
-
-Q_OverAllocatedInvoices
-    請求額超過割当
-
-Q_UnallocatedPayments
-    未割当・一部未割当入金
-
-Q_PaymentOverAllocation
-    入金額超過割当
-
-Q_OrphanAllocations
-    存在しない請求・入金への割当
-
-Q_MonthlySummary
-    月次集計
+未入金
+一部入金
+過剰割当
+未割当入金
+入金割当超過
 ```
+
+ステータス不整合、キャンセル請求への割当、期限超過不整合、参照不整合は個別Queryおよび月次サマリーで確認する。
 
 ---
 
 # 17. 画面要件
 
-Phase 1では以下の3画面を作成する。
+Phase 1では以下の4画面を使用する。
 
 ```text
+F_Login
 F_MainMenu
-
 F_CsvImport
-
 F_CheckResult
 ```
+
+## F_Login
+
+以下を入力できること。
+
+```text
+API Base URL
+メールアドレス
+パスワード
+```
+
+`POST /auth/login` を実行し、成功時はJWTとAPI Base URLをAccess実行中のみ保持する。
+
+パスワードはログイン成功後に画面から消去し、TempVars等へ保持しない。
 
 ## F_MainMenu
 
@@ -544,17 +635,29 @@ F_CheckResult
 
 ```text
 CSV取込
-
-月次チェック
-
 チェック結果
-
-月次レポート
+月次サマリー
+月次確認レポート
+終了
 ```
 
 ## F_CsvImport
 
-以下のCSVを指定して取り込めること。
+以下の2方式で取込できること。
+
+### API自動取込
+
+```text
+対象年
+対象月
+Invoiceから取得・取込
+```
+
+ボタン操作により、API取得、ZIP展開、3CSVパス設定、既存Import Table削除、UTF-8 CSV取込、件数表示まで実行する。
+
+### 手動取込
+
+以下のCSVを個別指定して取り込めること。
 
 ```text
 請求CSV
@@ -566,7 +669,7 @@ CSV取込
 
 ## F_CheckResult
 
-以下の種類で結果を絞り込めること。
+以下の主な種類で結果を絞り込めること。
 
 ```text
 すべて
@@ -574,8 +677,7 @@ CSV取込
 一部入金
 過剰割当
 未割当入金
-割当額超過
-参照不整合
+入金割当超過
 ```
 
 ---
@@ -588,21 +690,36 @@ CSV取込
 R_MonthlyCheck
 ```
 
-レポートには少なくとも以下を表示する。
+レコードソースは `Q_MonthlySummary` とする。
+
+レポート上部には対象年月を表示する。
 
 ```text
-対象年月
-CSV取込件数
+対象年月：YYYY年MM月
+```
+
+レポートには以下を表示する。
+
+```text
 請求件数
 請求金額
 入金件数
 入金金額
+
 未入金件数
 一部入金件数
 過剰割当件数
-未割当入金件数
-割当額超過件数
+
+未割当・一部未割当入金件数
+入金割当超過件数
+
+ステータス不整合件数
+キャンセル請求への割当件数
+期限超過状態不整合件数
+参照不整合件数
 ```
+
+1ページで月次確認結果を把握できるレイアウトとする。
 
 ---
 
@@ -616,21 +733,38 @@ AccessからInvoice Management SystemのDBを変更しない。
 
 ## 19.2 再実行性
 
-同じCSVを使用して再取込・再照合できること。
+同じ対象年月を指定して、API取得・再取込・再照合できること。
+
+手動CSVを使用する場合も、同じCSVを再取込・再照合できること。
 
 ## 19.3 トレーサビリティ
 
-不整合結果から以下のIDを確認できること。
+不整合結果から対象を識別できること。
 
 ```text
 InvoiceId
 PaymentId
 AllocationId
+InvoiceNumber
 ```
 
 ## 19.4 可搬性
 
-CSVファイルの保存先を固定パスに依存させず、利用者がファイル選択できること。
+手動取込ではCSV保存先を固定パスに依存させず、利用者がファイル選択できること。
+
+API自動取込で取得したZIP / CSVはOSの一時領域配下へ保存し、リポジトリ固有の絶対パスへ依存しないこと。
+
+## 19.5 認証情報
+
+JWTとAPI Base URLはAccess実行中のみ `TempVars` に保持する。
+
+パスワードは保持しない。
+
+Access Export APIはAdmin権限を必要とする。
+
+## 19.6 文字コード
+
+CSVはUTF-8 BOM付きとし、Access側では `CodePage:=65001` を指定して取り込む。
 
 ---
 
@@ -649,6 +783,8 @@ DueDate
 TotalAmount
 StatusCode
 StatusName
+IsOverdue
+IsClosed
 MemberName
 ```
 
@@ -681,28 +817,47 @@ Phase 1ではこの3CSVをAccessとの正式なデータ連携インターフェ
 Phase 1は以下を満たした時点で完成とする。
 
 ```text
-Invoice Management System
-        ↓
-3種類のCSVを出力
-        ↓
-Accessへ取込
-        ↓
+F_Login
+    ↓
+Invoice APIへAdminログイン
+    ↓
+JWT取得
+    ↓
+対象年月指定
+    ↓
+GET /api/admin/access-export
+    ↓
+3CSVを含むZIP取得
+    ↓
+ZIP自動展開
+    ↓
+Accessへ3CSV取込
+    ↓
 InvoiceId / PaymentIdでPaymentAllocationを集計
-        ↓
+    ↓
 請求額・入金額と照合
-        ↓
-未入金
-一部入金
-過剰割当
-未割当入金
-割当額超過
+    ↓
+未入金 / 一部入金 / 過剰割当
+未割当入金 / 入金割当超過
+ステータス不整合
+キャンセル請求への割当
+期限超過状態不整合
 参照不整合
-        ↓
-一覧表示
-        ↓
-月次確認レポート
+    ↓
+F_CheckResult
+    ↓
+Q_MonthlySummary
+    ↓
+R_MonthlyCheck
 ```
+
+対象年月の基本集計は `Q_TargetMonthInvoices` / `Q_TargetMonthPayments` を介して動的に切り替わること。
+
+本番相当環境のInvoice APIへHTTPS接続し、ログインからZIP取得、CSV取込、月次集計、レポート表示までE2Eで確認できること。
 
 Access側からInvoice Management Systemへの更新は行わない。
 
 本ツールはInvoice Management Systemに対する月次照合・確認用の業務支援ツールとして位置付ける。
+
+---
+

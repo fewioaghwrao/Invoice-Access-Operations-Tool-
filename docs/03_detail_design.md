@@ -4,9 +4,9 @@
 
 ### 1.1 目的
 
-本書は、Invoice Management System に追加する Access 月次照合用Export機能について、実装レベルの詳細設計を定義する。
+本書は、Invoice Management System に追加する Access 月次照合用Export機能、および Microsoft Access 側のAPI取得・CSV取込・月次照合処理について、実装レベルの詳細設計を定義する。
 
-本機能は以下の3種類のデータをCSVとして生成し、1つのZIPファイルとして返却する。
+Invoice側は以下の3種類のデータをCSVとして生成し、1つのZIPファイルとして返却する。
 
 ```text
 invoices_YYYYMM.csv
@@ -14,7 +14,9 @@ payments_YYYYMM.csv
 allocations_YYYYMM.csv
 ```
 
-生成したデータは Microsoft Access 側で取り込み、請求・入金・入金割当の照合に使用する。
+Access側はAdminログインで取得したJWTを用いてZIPを取得し、3CSVをImport Tableへ取り込み、請求・入金・入金割当を再集計して照合する。
+
+Phase 1では、対象年月に応じた基本集計と `R_MonthlyCheck` による1ページの月次確認レポートまでを実装範囲とする。
 
 ---
 
@@ -1299,6 +1301,8 @@ Admin → 200
 
 # 54. 実装順序
 
+## 54.1 Invoice側
+
 ```text
 1. AccessInvoiceExportRow
 2. AccessPaymentExportRow
@@ -1318,49 +1322,112 @@ Admin → 200
 16. Swagger / 実API確認
 ```
 
+## 54.2 Access側
+
+```text
+1. Import Table作成
+2. 照合Query作成
+3. F_CheckResult作成
+4. F_MainMenu作成
+5. F_CsvImport作成
+6. F_Login作成
+7. JWTログイン連携
+8. ZIP取得処理
+9. ZIP展開処理
+10. UTF-8 CSV自動取込
+11. TargetYear / TargetMonth保持
+12. Q_TargetMonthInvoices
+13. Q_TargetMonthPayments
+14. Q_MonthlySummary動的集計
+15. R_MonthlyCheck
+16. VPS APIとのE2E動作確認
+```
+
 ---
 
 # 55. 実装完了確認
 
-以下をすべて満たした場合、Invoice側Access Export機能の実装完了とする。
+以下をすべて満たした場合、Phase 1実装完了とする。
+
+## 55.1 Invoice側
 
 ```text
 dotnet build 成功
-
-↓
-
-GET
-/api/admin/access-export
-?year=2026
-&month=9
-
-↓
-
+    ↓
+GET /api/admin/access-export
+?year=YYYY
+&month=MM
+    ↓
 HTTP 200
-
-↓
-
-invoice-access-202609.zip
-
-↓
-
-invoices_202609.csv
-payments_202609.csv
-allocations_202609.csv
-
-↓
-
+    ↓
+invoice-access-YYYYMM.zip
+    ↓
+invoices_YYYYMM.csv
+payments_YYYYMM.csv
+allocations_YYYYMM.csv
+    ↓
 各CSVがUTF-8 BOM付き
-
-↓
-
-Accessで取込可能
-
-↓
-
-Invoice / Payment / Allocationの
-参照関係を確認可能
 ```
+
+## 55.2 Access側
+
+```text
+F_Login
+    ↓
+POST /auth/login
+    ↓
+JWT取得
+    ↓
+F_CsvImport
+    ↓
+TargetYear / TargetMonth
+    ↓
+Invoiceから取得・取込
+    ↓
+ZIP取得・展開
+    ↓
+3CSV UTF-8取込
+    ↓
+Invoice / Payment / Allocation照合
+    ↓
+Q_TargetMonthInvoices
+Q_TargetMonthPayments
+    ↓
+Q_MonthlySummary
+    ↓
+R_MonthlyCheck
+```
+
+## 55.3 E2E
+
+本番相当のVPS APIにHTTPS接続し、以下を確認する。
+
+```text
+Adminログイン成功
+Access Export API成功
+ZIP取得成功
+CSV取込成功
+対象月抽出成功
+月次サマリー成功
+月次確認レポート表示成功
+```
+
+2027年2月の動作確認例：
+
+```text
+Import Snapshot
+Invoice    : 17件
+Payment    : 16件
+Allocation : 16件
+
+Target Month
+InvoiceCount  : 4件
+InvoiceAmount : 450000
+PaymentCount  : 5件
+PaymentAmount : 400000
+```
+
+上記の基本集計が `Q_MonthlySummary` と `R_MonthlyCheck` で一致することを確認する。
 
 ---
 
@@ -1381,7 +1448,9 @@ Exportファイルのサーバー保存
 
 ---
 
-# 57. 最終クラス関係
+# 57. 最終クラス・処理関係
+
+## 57.1 Invoice側
 
 ```text
 AccessExportEndpoints
@@ -1393,7 +1462,6 @@ AccessExportQuery
 IAccessExportService
         ▲
         │ implements
-        │
 AccessExportService
         │
         ▼
@@ -1419,4 +1487,577 @@ byte[]
 Results.File
 ```
 
-本構成により、既存Sales Exportとは独立したAccess月次照合用データ出力機能として実装する。
+## 57.2 Access側
+
+```text
+F_Login
+    │
+    ├─ ApiBaseUrl
+    ├─ Email
+    └─ Password
+    │
+    ▼
+POST /auth/login
+    │
+    ▼
+TempVars
+    ├─ AccessToken
+    └─ ApiBaseUrl
+    │
+    ▼
+F_CsvImport
+    ├─ TargetYear
+    └─ TargetMonth
+    │
+    ▼
+TempVars
+    ├─ TargetYear
+    └─ TargetMonth
+    │
+    ▼
+GET /api/admin/access-export
+    │
+    ▼
+ZIP
+    │
+    ▼
+3CSV
+    │
+    ▼
+Import Tables
+    │
+    ├─ 照合Query
+    ├─ Q_TargetMonthInvoices
+    └─ Q_TargetMonthPayments
+    │
+    ▼
+Q_MonthlySummary
+    │
+    ▼
+R_MonthlyCheck
+```
+
+本構成により、既存Sales Exportとは独立したAccess月次照合用データ出力機能と、Access側の月次照合EUCを一連の処理として構成する。
+
+---
+
+
+
+---
+
+# 58. F_Login 詳細設計
+
+## 58.1 コントロール
+
+```text
+txtApiBaseUrl
+txtEmail
+txtPassword
+btnLogin
+```
+
+## 58.2 ログイン処理
+
+`btnLogin_Click` では以下を行う。
+
+```text
+入力値取得
+    ↓
+必須チェック
+    ↓
+ApiBaseUrl末尾 / 除去
+    ↓
+JSON生成
+    ↓
+POST /auth/login
+    ↓
+HTTP Status確認
+    ↓
+Response JSONからJWT抽出
+    ↓
+TempVars更新
+    ↓
+Password欄クリア
+    ↓
+F_MainMenu表示
+```
+
+Request：
+
+```json
+{
+  "email": "...",
+  "password": "..."
+}
+```
+
+Header：
+
+```http
+Content-Type: application/json
+Accept: application/json
+```
+
+HTTP 200以外の場合は、`Status` と `ResponseText` を表示して処理を終了する。
+
+## 58.3 JSON文字列処理
+
+メールアドレスとパスワードはJSON文字列として送信するため、最低限以下をEscapeする。
+
+```text
+\      → \\
+"      → \"
+CR/LF  → \n
+```
+
+## 58.4 JWT抽出
+
+レスポンス差異に備え、以下のキーを順番に確認する。
+
+```text
+accessToken
+token
+access_token
+```
+
+現行Invoice APIの `LoginResponse` では `Token` が返却される。
+
+## 58.5 TempVars
+
+ログイン成功時：
+
+```vb
+TempVars.Add "AccessToken", token
+TempVars.Add "ApiBaseUrl", baseUrl
+```
+
+既存値がある場合は削除してから再設定する。
+
+パスワードはTempVarsへ保存しない。
+
+---
+
+# 59. F_CsvImport 詳細設計
+
+## 59.1 コントロール
+
+```text
+txtInvoiceCsv
+txtPaymentCsv
+txtAllocationCsv
+
+txtTargetYear
+txtTargetMonth
+
+btnDownloadFromInvoice
+btnImport
+btnBack
+lblApiStatus
+```
+
+`btnDownloadFromInvoice` の表示名は「Invoiceから取得・取込」とする。
+
+## 59.2 対象年月
+
+入力値を検証する。
+
+```text
+TargetYear  : 2000～2100
+TargetMonth : 1～12
+```
+
+検証後、対象年月をTempVarsへ保存する。
+
+```vb
+TempVars.Add "TargetYear", targetYear
+TempVars.Add "TargetMonth", targetMonth
+```
+
+---
+
+# 60. Access Export API呼出 詳細
+
+Request URL：
+
+```text
+{ApiBaseUrl}/api/admin/access-export?year={year}&month={month}
+```
+
+Header：
+
+```http
+Authorization: Bearer {AccessToken}
+Accept: application/zip
+```
+
+Response：
+
+```text
+HTTP 200
+Content-Type: application/zip
+```
+
+保存先：
+
+```text
+%TEMP%\InvoiceAccessOperations\invoice-access-YYYYMM.zip
+```
+
+保存には `ADODB.Stream` のBinary Modeを利用する。
+
+HTTP 401 / 403 は認証・権限エラーとして利用者へ通知する。
+
+---
+
+# 61. ZIP展開 詳細
+
+ZIP展開にはPowerShellを利用する。
+
+```powershell
+Expand-Archive -LiteralPath '<zip>' -DestinationPath '<dir>' -Force
+```
+
+展開先：
+
+```text
+%TEMP%\InvoiceAccessOperations\extract-YYYYMM
+```
+
+展開前に同名ディレクトリが存在する場合は削除して再作成する。
+
+展開後、以下3ファイルの存在を確認する。
+
+```text
+invoices_YYYYMM.csv
+payments_YYYYMM.csv
+allocations_YYYYMM.csv
+```
+
+1つでも存在しない場合はエラーとする。
+
+---
+
+# 62. CSV取込 詳細
+
+## 62.1 既存データ削除
+
+```text
+T_AllocationImport
+    ↓
+T_PaymentImport
+    ↓
+T_InvoiceImport
+```
+
+の順に削除する。
+
+## 62.2 UTF-8取込
+
+```vb
+DoCmd.TransferText _
+    TransferType:=acImportDelim, _
+    TableName:="T_InvoiceImport", _
+    FileName:=CStr(Me.txtInvoiceCsv.Value), _
+    HasFieldNames:=True, _
+    CodePage:=65001
+```
+
+Payment / Allocationも同様に `CodePage:=65001` を指定する。
+
+これはUTF-8 BOM付きCSVの先頭ヘッダーを正しく認識するために必要である。
+
+## 62.3 取込完了表示
+
+以下の件数を `DCount` で表示する。
+
+```text
+Invoice
+Payment
+Allocation
+```
+
+---
+
+# 63. Q_TargetMonthInvoices 詳細
+
+目的：
+
+> 累積スナップショットから、対象年月に発生したInvoiceだけを基本集計用に抽出する。
+
+SQL：
+
+```sql
+SELECT *
+FROM T_InvoiceImport
+WHERE
+    InvoiceDate >= DateSerial(
+        TempVars!TargetYear,
+        TempVars!TargetMonth,
+        1
+    )
+    AND
+    InvoiceDate < DateSerial(
+        TempVars!TargetYear,
+        TempVars!TargetMonth + 1,
+        1
+    );
+```
+
+`DateSerial` に翌月を指定することで、12月から翌年1月への繰上げもAccess側に任せる。
+
+---
+
+# 64. Q_TargetMonthPayments 詳細
+
+目的：
+
+> 累積スナップショットから、対象年月に発生したPaymentだけを基本集計用に抽出する。
+
+SQL：
+
+```sql
+SELECT *
+FROM T_PaymentImport
+WHERE
+    PaymentDate >= DateSerial(
+        TempVars!TargetYear,
+        TempVars!TargetMonth,
+        1
+    )
+    AND
+    PaymentDate < DateSerial(
+        TempVars!TargetYear,
+        TempVars!TargetMonth + 1,
+        1
+    );
+```
+
+---
+
+# 65. Q_MonthlySummary 詳細
+
+1レコードの月次サマリーを返す。
+
+SQL：
+
+```sql
+SELECT
+    DCount("*", "Q_TargetMonthInvoices") AS InvoiceCount,
+    Nz(
+        DSum(
+            "TotalAmount",
+            "Q_TargetMonthInvoices",
+            "StatusCode <> 'CANCELLED'"
+        ),
+        0
+    ) AS InvoiceAmount,
+    DCount("*", "Q_TargetMonthPayments") AS PaymentCount,
+    Nz(
+        DSum(
+            "Amount",
+            "Q_TargetMonthPayments"
+        ),
+        0
+    ) AS PaymentAmount,
+    DCount("*", "Q_UnpaidInvoices") AS UnpaidCount,
+    DCount("*", "Q_PartiallyPaidInvoices") AS PartiallyPaidCount,
+    DCount("*", "Q_OverAllocatedInvoices") AS OverAllocatedInvoiceCount,
+    DCount("*", "Q_UnallocatedPayments") AS UnallocatedPaymentCount,
+    DCount("*", "Q_PaymentOverAllocation") AS PaymentOverAllocationCount,
+    DCount("*", "Q_StatusMismatch") AS StatusMismatchCount,
+    DCount("*", "Q_CancelledWithAllocation") AS CancelledWithAllocationCount,
+    DCount("*", "Q_PastDueMismatch") AS PastDueMismatchCount,
+    DCount("*", "Q_OrphanAllocations") AS OrphanAllocationCount
+FROM
+    T_InvoiceImport
+WHERE
+    InvoiceId = DMin("InvoiceId", "T_InvoiceImport");
+```
+
+基本4項目は対象月Queryを参照する。
+
+照合件数は取込スナップショット全体のQueryを参照する。
+
+---
+
+# 66. R_MonthlyCheck 詳細
+
+## 66.1 RecordSource
+
+```text
+Q_MonthlySummary
+```
+
+## 66.2 対象年月表示
+
+テキストボックスのControlSource：
+
+```text
+="対象年月：" & [TempVars]![TargetYear] & "年" & Format([TempVars]![TargetMonth],"00") & "月"
+```
+
+表示例：
+
+```text
+対象年月：2027年02月
+```
+
+## 66.3 フィールド対応
+
+| 表示 | ControlSource |
+|---|---|
+| 請求件数 | InvoiceCount |
+| 請求金額 | InvoiceAmount |
+| 入金件数 | PaymentCount |
+| 入金金額 | PaymentAmount |
+| 未入金 | UnpaidCount |
+| 一部入金 | PartiallyPaidCount |
+| 過剰割当 | OverAllocatedInvoiceCount |
+| 未割当・一部未割当 | UnallocatedPaymentCount |
+| 入金割当超過 | PaymentOverAllocationCount |
+| ステータス不整合 | StatusMismatchCount |
+| キャンセル請求に割当 | CancelledWithAllocationCount |
+| 期限超過状態不整合 | PastDueMismatchCount |
+| 参照不整合 | OrphanAllocationCount |
+
+1ページ内で、
+
+```text
+基本集計
+請求チェック
+入金チェック
+その他の整合性チェック
+```
+
+の4ブロックに分ける。
+
+---
+
+# 67. F_CheckResult 詳細
+
+`Q_CheckResult` をRecordSourceとする。
+
+主な表示項目：
+
+```text
+CheckType
+TargetType
+TargetId
+InvoiceNumber
+TargetName
+BaseAmount
+AllocatedAmount
+DifferenceAmount
+StatusCode
+CheckMessage
+```
+
+ヘッダーの `cboCheckType` で以下を絞り込む。
+
+```text
+すべて
+未入金
+一部入金
+過剰割当
+未割当入金
+入金割当超過
+```
+
+`すべて` の場合は `FilterOn = False` とする。
+
+---
+
+# 68. F_MainMenu 詳細
+
+Access起動時に `F_MainMenu` を表示する。
+
+ボタン：
+
+```text
+CSV取込
+チェック結果を開く
+月次サマリーを開く
+月次確認レポート
+終了
+```
+
+月次確認レポートは印刷プレビューで開く。
+
+```vb
+DoCmd.OpenReport "R_MonthlyCheck", acViewPreview
+```
+
+---
+
+# 69. E2E動作確認
+
+本番相当構成：
+
+```text
+Microsoft Access
+    ↓ HTTPS
+nginx
+    ↓
+ASP.NET Core API
+    ↓
+PostgreSQL
+```
+
+2027年2月の確認結果：
+
+```text
+API / Import Snapshot
+Invoice    : 17
+Payment    : 16
+Allocation : 16
+
+Q_TargetMonthInvoices
+4 records
+
+Q_TargetMonthPayments
+5 records
+
+Q_MonthlySummary
+InvoiceCount  = 4
+InvoiceAmount = 450000
+PaymentCount  = 5
+PaymentAmount = 400000
+
+R_MonthlyCheck
+請求件数 = 4
+請求金額 = 450000
+入金件数 = 5
+入金金額 = 400000
+```
+
+対象月Query、月次サマリー、レポートの基本集計が一致することを確認する。
+
+---
+
+# 70. Phase 1 最終状態
+
+Phase 1の最終処理は以下とする。
+
+```text
+Invoice Management System
+        ↓
+Admin JWT認証
+        ↓
+Access Export API
+        ↓
+ZIP / 3CSV
+        ↓
+Microsoft Access
+        ↓
+Import Table
+        ↓
+再集計・照合
+        ↓
+F_CheckResult
+        ↓
+Q_MonthlySummary
+        ↓
+R_MonthlyCheck
+```
+
+AccessはInvoice Management SystemのCRUDを代替せず、正データを変更しない月次照合・確認用EUCとして運用する。

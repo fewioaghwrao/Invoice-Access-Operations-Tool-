@@ -4,65 +4,88 @@
 
 ### 1.1 目的
 
-本書は、Invoice Management System から Microsoft Access 月次照合ツールへ連携するためのCSV Export機能について、基本設計を定義する。
+本書は、Invoice Management System と Microsoft Access 月次照合ツールを連携するための基本設計を定義する。
 
 対象範囲は以下とする。
 
+- AccessからInvoice APIへの管理者ログイン
+- JWTを利用したAccess Export API呼出
 - Access Export API
 - 対象データ抽出条件
 - ZIPファイル構成
 - invoices CSV
 - payments CSV
 - allocations CSV
+- Access側ZIP展開・CSV取込
+- 対象年月の保持と月次抽出
 - ステータス照合ルール
+- 月次サマリー
+- 月次確認レポート
 - エラー処理
-- Access側との責務境界
+- Invoice側とAccess側の責務境界
 
 ---
 
 # 2. システム構成
 
 ```text
-Invoice Management System
-        │
-        │ GET /api/admin/access-export
-        │     ?year=2026
-        │     &month=9
-        ▼
-AccessExport Endpoint
-        │
-        ▼
-AccessExportService
-        │
-        ├─ Invoice取得
-        ├─ Payment取得
-        └─ PaymentAllocation取得
-        │
-        ▼
-CSV生成
-        │
-        ├─ invoices_202609.csv
-        ├─ payments_202609.csv
-        └─ allocations_202609.csv
-        │
-        ▼
-ZIP生成
-        │
-        ▼
-invoice-access-202609.zip
-        │
-        ▼
 Microsoft Access
-        │
-        ├─ CSV取込
-        ├─ 入金照合
-        ├─ ステータス照合
-        └─ 月次確認
+│
+├─ F_Login
+│    │ POST /auth/login
+│    ▼
+│  JWT / ApiBaseUrl
+│    │ TempVars
+│    ▼
+├─ F_CsvImport
+│    │ TargetYear / TargetMonth
+│    │ GET /api/admin/access-export
+│    ▼
+│
+├──────────── HTTPS ────────────┐
+│                               ▼
+│                     nginx / ConoHa VPS
+│                               │
+│                               ▼
+│                    Invoice Management System
+│                    ASP.NET Core API
+│                               │
+│                               ▼
+│                          PostgreSQL
+│
+│                    AccessExportDataDto
+│                               │
+│                               ▼
+│                    AccessExportCsvBuilder
+│                               │
+│                               ▼
+│                    AccessExportZipBuilder
+│                               │
+└──────── invoice-access-YYYYMM.zip
+                │
+                ▼
+        PowerShell Expand-Archive
+                │
+                ├─ invoices_YYYYMM.csv
+                ├─ payments_YYYYMM.csv
+                └─ allocations_YYYYMM.csv
+                │
+                ▼
+        T_InvoiceImport
+        T_PaymentImport
+        T_AllocationImport
+                │
+                ├─ 照合Query
+                ├─ 対象月Query
+                ├─ Q_MonthlySummary
+                └─ R_MonthlyCheck
 ```
 
 Invoice Management System を正データの管理主体とする。
 
 AccessからInvoice Management SystemのDBに対する登録・更新・削除は行わない。
+
+通常はAPI自動連携を使用し、APIを利用できない場合は3CSVを手動指定して同じImport Tableへ取り込む。
 
 ---
 
@@ -813,20 +836,36 @@ AppDbContext
 
 ---
 
-# 24. AccessExportService責務
+# 24. Access Export関連クラスの責務
 
-AccessExportServiceは以下を担当する。
+Access Exportは責務を分離して実装する。
 
-1. year / monthから対象期間を算出する
-2. Invoiceを抽出する
-3. Paymentを抽出する
-4. PaymentAllocationを抽出する
-5. 各Export DTOへ変換する
-6. CSVを生成する
-7. 3CSVをZIPへ格納する
-8. EndpointへZIPデータを返却する
+| クラス | 責務 |
+|---|---|
+| `AccessExportEndpoints` | HTTP受付、year/month validation、Service呼出、ZIP Response生成 |
+| `IAccessExportService` | Application層のExport Service契約 |
+| `AccessExportService` | 対象期間算出、Invoice / Payment / Allocation取得、DTO生成 |
+| `AccessExportCsvBuilder` | DTOから3CSV文字列を生成 |
+| `AccessExportZipBuilder` | 3CSVをUTF-8 BOM付きでZIPへ格納 |
+| `AccessExportDataDto` | Export対象データ一式を保持 |
 
-Accessで実施する入金状態判定や不整合判定はServiceでは行わない。
+`AccessExportService`ではCSV生成、ZIP生成、Access側の照合判定は行わない。
+
+```text
+AccessExportEndpoints
+        ↓
+IAccessExportService
+        ↓
+AccessExportService
+        ↓
+AccessExportDataDto
+        ↓
+AccessExportCsvBuilder
+        ↓
+AccessExportZipBuilder
+        ↓
+application/zip
+```
 
 ---
 
@@ -917,7 +956,9 @@ Phase 1では単一Export処理内で3データを取得することを基本と
 
 # 28. ログ
 
-Access Export実行時には、既存ログ方式に合わせて以下を記録する。
+Phase 1では既存のSerilog HTTP Request Loggingを利用する。
+
+Access Export専用の業務ログを追加する場合は、以下を候補とする。
 
 ```text
 対象年月
@@ -928,7 +969,9 @@ Allocation出力件数
 処理結果
 ```
 
-CSV内容そのものや個人情報はログへ出力しない。
+CSV内容そのもの、MemberName、PayerName、JWT、パスワード等はログへ出力しない。
+
+現行実装では、専用業務ログの追加をPhase 1完成条件には含めない。
 
 ---
 
@@ -936,7 +979,25 @@ CSV内容そのものや個人情報はログへ出力しない。
 
 Access Export APIはAdmin専用とする。
 
-CSVにはMemberNameやPayerName等の業務情報を含むため、一般ユーザーから実行できないこと。
+Access側は `POST /auth/login` で取得したJWTをBearer Tokenとして送信する。
+
+```http
+Authorization: Bearer {token}
+```
+
+Access側の認証情報保持方針：
+
+| 項目 | 保持方法 |
+|---|---|
+| JWT | `TempVars("AccessToken")` |
+| API Base URL | `TempVars("ApiBaseUrl")` |
+| 対象年 | `TempVars("TargetYear")` |
+| 対象月 | `TempVars("TargetMonth")` |
+| パスワード | 保持しない |
+
+ログイン成功後はパスワード入力欄をクリアする。
+
+CSVにはMemberNameやPayerName等の業務情報を含むため、一般ユーザーからAccess Exportを実行できないこと。
 
 以下はCSVへ出力しない。
 
@@ -1002,23 +1063,51 @@ PaymentId,MemberId,PaymentDate,Amount,PayerName,Method
 
 Access側ではZIP展開後の3CSVを1セットとして取り込む。
 
+API自動連携：
+
 ```text
-invoice-access-202609.zip
+F_Login
         ↓
-展開
+Admin JWT取得
         ↓
-3CSV確認
+F_CsvImport
+        ↓
+対象年月指定
+        ↓
+Access Export API
+        ↓
+invoice-access-YYYYMM.zip
+        ↓
+PowerShell Expand-Archive
+        ↓
+3CSV存在確認
         ↓
 既存Import Tableクリア
         ↓
-CSV取込
+UTF-8 CSV取込
         ↓
 件数確認
         ↓
-照合Query実行
+照合Query / 月次Query
 ```
 
-3CSVのうち1ファイルでも存在しない場合は照合処理を開始しない。
+3CSVのうち1ファイルでも存在しない場合は取込完了扱いにしない。
+
+Import Tableの削除順は参照関係を考慮し、
+
+```text
+T_AllocationImport
+    ↓
+T_PaymentImport
+    ↓
+T_InvoiceImport
+```
+
+とする。
+
+CSV取込時は `CodePage:=65001` を指定する。
+
+手動取込も同じImport Tableと照合Queryを利用する。
 
 ---
 
@@ -1027,65 +1116,90 @@ CSV取込
 ```text
 利用者
  │
- │ Access Export実行
+ │ API URL / Admin credentials
+ ▼
+F_Login
+ │
+ │ POST /auth/login
  ▼
 Invoice API
+ │
+ │ JWT
+ ▼
+F_Login
+ │
+ │ AccessToken / ApiBaseUrl → TempVars
+ ▼
+F_MainMenu
+ │
+ ▼
+F_CsvImport
+ │
+ │ TargetYear / TargetMonth
+ │ TargetYear / TargetMonth → TempVars
+ ▼
+GET /api/admin/access-export
+ │
+ ▼
+AccessExportEndpoints
  │
  │ year/month validation
  ▼
 AccessExportService
  │
- ├───────────────┐
- │               │
- ▼               │
-Invoices取得     │
- │               │
- ▼               │
-Payments取得     │
- │               │
- ▼               │
-Allocations取得  │
- │               │
- └───────┬───────┘
-         ▼
-      DTO変換
-         │
-         ▼
-      CSV生成
-         │
-         ▼
-      ZIP生成
-         │
-         ▼
-HTTP Response
-         │
-         ▼
+ ├─ Invoice取得
+ ├─ Payment取得
+ └─ Allocation取得
+ │
+ ▼
+AccessExportDataDto
+ │
+ ▼
+AccessExportCsvBuilder
+ │
+ ▼
+AccessExportZipBuilder
+ │
+ ▼
 invoice-access-YYYYMM.zip
+ │
+ ▼
+Access VBA
+ │
+ ├─ ZIP保存
+ ├─ ZIP展開
+ ├─ 3CSV存在確認
+ ├─ Import Tableクリア
+ └─ TransferText(CodePage=65001)
+ │
+ ▼
+Q_TargetMonthInvoices / Q_TargetMonthPayments
+ │
+ ▼
+Q_MonthlySummary
+ │
+ ▼
+R_MonthlyCheck
 ```
 
 ---
 
 # 34. Phase 1 完成条件
 
-Invoice側について以下を満たした時点でPhase 1 Export機能完成とする。
+Invoice側について以下を満たすこと。
 
 ```text
-Adminユーザーが
-year / monthを指定
-        ↓
-Access Export API実行
-        ↓
-対象Invoice取得
-対象Payment取得
-対象Allocation取得
-        ↓
+Adminユーザー
+    ↓
+GET /api/admin/access-export
+    ↓
+対象Invoice / Payment / Allocation取得
+    ↓
 3CSV生成
-        ↓
+    ↓
 ZIP生成
-        ↓
-ダウンロード
-        ↓
-Accessへ取込可能
+    ↓
+HTTP 200 application/zip
 ```
 
 ZIPには必ず以下を含む。
@@ -1096,21 +1210,35 @@ payments_YYYYMM.csv
 allocations_YYYYMM.csv
 ```
 
-Access側ではこれらの元データから、
+Access側について以下を満たすこと。
 
 ```text
-未入金
-一部入金
-入金済
+F_LoginでAdminログイン
+    ↓
+JWT取得
+    ↓
+F_CsvImportで対象年月指定
+    ↓
+ZIP取得・展開・3CSV自動取込
+    ↓
+未入金 / 一部入金 / 入金済
 過剰割当
-未割当入金
-入金割当超過
+未割当入金 / 入金割当超過
 ステータス不整合
+キャンセル請求への割当
 期限超過不整合
 参照不整合
+    ↓
+F_CheckResult
+    ↓
+対象月基本集計
+    ↓
+Q_MonthlySummary
+    ↓
+R_MonthlyCheck
 ```
 
-を判定できること。
+本番相当のVPS APIへHTTPS接続し、ログインから月次レポートまでE2Eで動作確認できること。
 
 ---
 
@@ -1163,3 +1291,237 @@ PaymentAllocation
 > Invoice Management Systemのデータ整合性を確認する周辺業務・月次照合ツール
 
 として位置付ける。
+
+---
+
+# 37. Accessログイン設計
+
+## 37.1 F_Login
+
+入力項目：
+
+```text
+txtApiBaseUrl
+txtEmail
+txtPassword
+```
+
+実行ボタン：
+
+```text
+btnLogin
+```
+
+ログイン時に以下を実行する。
+
+```text
+入力チェック
+    ↓
+POST {ApiBaseUrl}/auth/login
+    ↓
+HTTP 200確認
+    ↓
+JWT抽出
+    ↓
+TempVarsへ保存
+    ↓
+パスワード欄クリア
+    ↓
+F_MainMenu表示
+```
+
+HTTP 200以外の場合は、HTTP StatusとResponse本文を表示して終了する。
+
+## 37.2 TempVars
+
+```text
+AccessToken
+ApiBaseUrl
+TargetYear
+TargetMonth
+```
+
+`AccessToken` と `ApiBaseUrl` はログイン成功時に設定する。
+
+`TargetYear` と `TargetMonth` はAPI取得時の対象年月として設定する。
+
+---
+
+# 38. F_CsvImport設計
+
+F_CsvImportは以下の2方式を提供する。
+
+```text
+1. API自動取得・取込
+2. 3CSV手動取込
+```
+
+API自動取得では以下を実行する。
+
+```text
+TargetYear / TargetMonth入力
+    ↓
+TempVars更新
+    ↓
+GET /api/admin/access-export
+    ↓
+ZIP保存
+    ↓
+ZIP展開
+    ↓
+3CSVパス自動設定
+    ↓
+ImportCsvFiles
+```
+
+ZIP保存先はWindowsの一時領域配下とする。
+
+```text
+%TEMP%\InvoiceAccessOperations
+```
+
+ZIP展開にはPowerShell `Expand-Archive` を利用する。
+
+---
+
+# 39. 対象月抽出設計
+
+Access Exportの3CSVは対象月末照合に必要な累積データを含む。
+
+そのため、月次の基本集計だけは対象年月で明示的に抽出する。
+
+## Q_TargetMonthInvoices
+
+```text
+InvoiceDate >= 対象月1日
+AND
+InvoiceDate < 翌月1日
+```
+
+## Q_TargetMonthPayments
+
+```text
+PaymentDate >= 対象月1日
+AND
+PaymentDate < 翌月1日
+```
+
+対象年月は `TempVars("TargetYear")` / `TempVars("TargetMonth")` を参照する。
+
+---
+
+# 40. Q_MonthlySummary設計
+
+`Q_MonthlySummary` は1レコードを返す。
+
+基本集計：
+
+| 項目 | 参照元 |
+|---|---|
+| InvoiceCount | Q_TargetMonthInvoices |
+| InvoiceAmount | Q_TargetMonthInvoices（CANCELLED除外） |
+| PaymentCount | Q_TargetMonthPayments |
+| PaymentAmount | Q_TargetMonthPayments |
+
+照合件数：
+
+```text
+Q_UnpaidInvoices
+Q_PartiallyPaidInvoices
+Q_OverAllocatedInvoices
+Q_UnallocatedPayments
+Q_PaymentOverAllocation
+Q_StatusMismatch
+Q_CancelledWithAllocation
+Q_PastDueMismatch
+Q_OrphanAllocations
+```
+
+基本集計は「対象月に発生したデータ」、照合件数は「取込スナップショット全体の確認対象」という役割分担とする。
+
+---
+
+# 41. R_MonthlyCheck設計
+
+`R_MonthlyCheck` のレコードソースは `Q_MonthlySummary` とする。
+
+レポート上部に対象年月を表示する。
+
+```text
+対象年月：YYYY年MM月
+```
+
+表示ブロック：
+
+```text
+基本集計
+請求チェック
+入金チェック
+その他の整合性チェック
+```
+
+1ページで月次確認結果を把握できるレイアウトとする。
+
+---
+
+# 42. F_MainMenu設計
+
+F_MainMenuは以下への入口を提供する。
+
+```text
+CSV取込
+チェック結果
+月次サマリー
+月次確認レポート
+終了
+```
+
+Access起動時の表示フォームとして使用する。
+
+---
+
+# 43. 動作確認構成
+
+本番相当確認では以下の経路を使用する。
+
+```text
+Microsoft Access
+    ↓ HTTPS
+nginx
+    ↓
+ASP.NET Core API
+    ↓
+PostgreSQL
+```
+
+確認項目：
+
+```text
+Adminログイン
+JWT取得
+Access Export API
+ZIP取得
+ZIP展開
+3CSV取込
+対象月抽出
+照合Query
+Q_MonthlySummary
+R_MonthlyCheck
+```
+
+---
+
+# 44. 最終責務分担
+
+```text
+Invoice Management System
+    = 正データ管理・Export用元データ提供
+
+Access Export API
+    = 対象年月基準の元データ抽出・ZIP/CSV提供
+
+Microsoft Access
+    = 取込・再集計・不整合確認・月次レポート
+```
+
+Access側で派生値を再計算することにより、既存Sales Exportと責務を分離し、月次照合用EUCとして独立させる。
