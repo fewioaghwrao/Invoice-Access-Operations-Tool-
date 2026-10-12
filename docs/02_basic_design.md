@@ -1525,3 +1525,80 @@ Microsoft Access
 ```
 
 Access側で派生値を再計算することにより、既存Sales Exportと責務を分離し、月次照合用EUCとして独立させる。
+# 45. Phase 2：ODBC参照専用連携 基本設計（2026年10月）
+
+## 45.1 システム構成とPhase 1との差分
+
+```text
+                Invoice Management System / PostgreSQL
+                                │
+       ┌────────────────────────┴─────────────────────┐
+       │                                              │
+  [Phase 1 / 業務経路]                        [Phase 2 / 参照検証経路]
+  ASP.NET Core Access Export API                    access_reporting Views
+       │                                              │
+  HTTPS + JWT                                        SELECT専用ロール
+       │                                              │
+  ZIP / 3CSV                                         PostgreSQL ODBC
+       │                                              │
+  Access T_*Import                                  Access L_*リンク
+       │                                              │
+  Q_InvoiceAllocationSummary                Q_ODBC_InvoiceAllocationSummary
+       └─────────────────────┬────────────────────────┘
+                             ▼
+                      Q_ODBC_CsvComparison
+```
+
+Phase 1の自動CSV取込・手動CSV取込・月次帳票への影響はない。Phase 2は読取専用の補助経路であり、本体データを更新しない。
+
+## 45.2 参照用スキーマ・View
+
+| View | 主な元データ | 目的 |
+|---|---|---|
+| `access_reporting.v_invoice_read` | `Invoices`＋`InvoiceStatuses`＋`Members` | 請求・ステータス・会員名をまとめて参照 |
+| `access_reporting.v_payment_read` | `Payments` | 入金明細を参照 |
+| `access_reporting.v_allocation_read` | `PaymentAllocations` | 入金割当を参照 |
+
+`v_invoice_read` は `InvoiceId, MemberId, InvoiceNumber, InvoiceDate, DueDate, TotalAmount, StatusId, StatusCode, StatusName, IsOverdue, IsClosed, MemberName` を提供する。Access側で割当合計と残額を算出し、既設CSV方式と同じ13項目を表示する。
+
+ViewはPostgreSQLが持つ現在のデータを参照する。CSV Exportの対象年月抽出条件は、ODBCの全件参照に自動適用されない。
+
+## 45.3 権限境界・接続
+
+PostgreSQLの `access_readonly` はCONNECT/USAGE/対象ViewへのSELECTに限定する。基底テーブルへの直接SELECT権限やViewへのINSERT/UPDATE/DELETEは付与しない。Viewの所有者権限による読み取りを利用するため、`security_invoker` を指定しない方式とする。
+
+WindowsのODBC接続検証では、psqlODBC Unicode(x64)と `InvoiceAccessDataLocal` DSNを利用。DBコンテナ `invoice_postgres` をローカルホストの5432番ポートで参照した。開発PCのDSN名・ポートは固定仕様ではなく、認証情報はドキュメントへ記録しない。
+
+元の `InvoiceAccessLocal`（別の空DB:5433用）とは分けて設定した。5432側は検証時に全ホストアドレスへポート公開されていたため、継続利用時はローカルループバックへの限定が望ましい。実環境やVPS側のDBポートを外部公開しないこと。
+
+## 45.4 Accessのクエリ設計
+
+| Accessオブジェクト | 役割 |
+|---|---|
+| `L_Invoice` | `v_invoice_read` のリンクテーブル |
+| `L_Payment` | `v_payment_read` のリンクテーブル |
+| `L_Allocation` | `v_allocation_read` のリンクテーブル |
+| `Q_ODBC_InvoiceAllocationSummary` | 請求単位でLEFT JOIN／GROUP BY、割当額・残額を計算 |
+| `Q_ODBC_ValidationSummary` | 6項目の集計値を1行で返す |
+| `Q_ODBC_CsvComparison` | CSVを基準としたInvoiceId一致・金額3項目の比較 |
+
+`Q_ODBC_InvoiceAllocationSummary` は既設の `Q_InvoiceAllocationSummary` と表示列を揃える。ただし、CSV側とODBC側は対象期間・取得時点が必ずしも同じではない。比較可能範囲を明示して評価する。
+
+## 45.5 確認済み結果・残課題
+
+| 項目 | Access ODBC | PostgreSQL | 比較結果 |
+|---|---:|---:|---|
+| InvoiceCount | 61 | 61 | 一致 |
+| TotalInvoiceAmount | 6,310,000 | 6,310,000 | 一致 |
+| TotalAllocatedAmount | 4,486,000 | 4,486,000 | 一致 |
+| TotalRemainingAmount | 1,824,000 | 1,824,000 | 一致 |
+| UnpaidInvoiceCount | 26 | 26 | 一致 |
+| OverAllocatedCount | 1 | 1 | 一致 |
+
+CSV側に存在する17件について、請求額・割当額・残額を照合し、17件すべて「一致」を確認した。**CSV取込側17件と、ODBC全件61件は抽出範囲が異なる**ことを前提とする。
+
+追加の比較では、CSV出力の年月でInvoiceDate/PaymentDateを揃え、Allocationは両方の対象に属するものだけを扱う必要がある。取得日時の違いや更新によって比較値が変化する可能性がある。VPSでのODBC接続、書込権限拒否の実操作、障害系・性能試験は今回の証跡対象外。
+
+詳細は [`04_odbc_readonly.md`](04_odbc_readonly.md) を参照する。
+
+---

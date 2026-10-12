@@ -61,7 +61,7 @@ Invoice Management System を正データの管理主体とする。
 
 AccessからInvoice Management SystemのDBを直接更新しない。
 
-API / CSVを介した一方向連携とし、Access側からInvoice本体への登録・更新・削除は行わない。
+**Phase 1**の業務連携はAPI / CSVを介した一方向連携とし、Access側からInvoice本体への登録・更新・削除は行わない。**Phase 2**では追加のODBC読取専用経路を許可するが、元テーブルの更新と基幹業務操作は引き続き禁止する。
 
 APIを利用できない場合に備え、3CSVを利用者が個別指定して取り込む手動経路も残す。
 
@@ -861,3 +861,52 @@ Access側からInvoice Management Systemへの更新は行わない。
 
 ---
 
+# 22. Phase 2：ODBC参照専用連携・照合検証の追加要件（2026年10月）
+
+## 22.1 位置付け・目的
+
+Phase 1のAPI/ZIP/3CSV取込と月次業務フローは維持する。Phase 2は、AccessからPostgreSQLの**参照専用View**をODBCリンクテーブルとして読み取り、既設のCSV方式と請求・入金割当の集計結果を比較検証するための追加機能とする。
+
+Phase 1の「Invoice DBへの直接接続は対象外」とした要件はPhase 1の範囲に適用する。Phase 2では**承認された読取専用View経由の参照のみ例外として許可**し、元テーブルへの直接SELECT、INSERT、UPDATE、DELETEはAccess用ユーザーに許可しない。
+
+## 22.2 機能要件
+
+1. `access_reporting` スキーマに請求・入金・入金割当の参照用Viewを用意する。
+2. PostgreSQLの `access_readonly` ロールには、DBのCONNECT、スキーマUSAGE、対象ViewへのSELECTのみを付与する。
+3. Accessでは `L_Invoice` / `L_Payment` / `L_Allocation` をODBCリンクテーブルとして追加する。
+4. `Q_ODBC_InvoiceAllocationSummary` で既設 `Q_InvoiceAllocationSummary` と同じ13項目の表示・集計を可能とする。
+5. `Q_ODBC_ValidationSummary` により6項目の集計値を算出する。
+6. `Q_ODBC_CsvComparison` により、既存CSV側のInvoiceIdに対応する請求額・割当額・残額をODBC側と照合する。
+7. 既存Import Table、API連携、`Q_MonthlySummary`、`R_MonthlyCheck` の動作を変更しない。
+
+## 22.3 読取専用・安全性要件
+
+- Access側からInvoice本体のCRUDは実行しない。
+- DB接続用ユーザーをInvoice APIが使用するDBユーザーから分離する。
+- ViewへのSELECT以外の操作と、基底テーブルへのアクセス権限を付与しない。
+- DBパスワード、接続文字列の秘密部分、JWTはGitHub公開物・証跡画像に含めない。
+- DSNの接続設定は開発PC固有のものとし、共有環境での接続は保護された経路を使う。
+- ODBCのローカル検証環境を本番公開設定へ転用しない。
+
+## 22.4 検証要件と確認済み結果
+
+| 検証 | 2026年10月の確認結果 |
+|---|---|
+| ODBC参照元（5432側ローカルDB） | Invoice 61 / Payment 108 / Allocation 58件 |
+| ODBC請求集計 | InvoiceId単位のLEFT JOIN / GROUP BY、61件 |
+| AccessとPostgreSQLの集計値 | 請求件数61、請求総額6,310,000、割当総額4,486,000、正味残額1,824,000、残額あり26、過剰割当1：6項目一致 |
+| CSV対ODBC比較 | 既存CSV17件について、請求額・割当額・残額の比較が17件一致、差異0件 |
+
+比較は**CSV側17件を基準にする部分集合検証**であり、ODBC側61件すべてに対するCSV結果の比較ではない。比較クエリは請求番号、日付、ステータス、会員名の値は判定しない。取得時点が一致することも未検証のため、後続の拡張対象とする。
+
+## 22.5 Phase 2対象外
+
+- ODBC経由での請求・入金・割当の登録、更新、削除
+- ODBC参照を月次CSV業務フローの必須経路へ変更すること
+- 過去任意日時の会計状態の完全再現
+- 大量データ性能試験、DB切断・障害時の網羅的復旧試験
+- 元DBに対する更新拒否の実操作による本番相当試験（DB権限検査・SELECT接続は別途確認）
+
+実装詳細は [`04_odbc_readonly.md`](04_odbc_readonly.md) を参照する。
+
+---
