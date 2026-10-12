@@ -2061,3 +2061,162 @@ R_MonthlyCheck
 ```
 
 AccessはInvoice Management SystemのCRUDを代替せず、正データを変更しない月次照合・確認用EUCとして運用する。
+# 71. Phase 2：ODBC参照専用連携 詳細設計（2026年10月）
+
+## 71.1 PostgreSQL View定義
+
+対象：既存データが存在するローカルDB `invoice_postgres`（5432側）。先行の空DB `invoice-system-postgres`（5433側）とは異なる。PostgreSQL内では`public`スキーマの既存テーブルを読む。Viewは実データを複製しない。
+
+```sql
+CREATE SCHEMA IF NOT EXISTS access_reporting;
+REVOKE ALL ON SCHEMA access_reporting FROM PUBLIC;
+
+CREATE OR REPLACE VIEW access_reporting.v_invoice_read AS
+SELECT
+    i."Id" AS "InvoiceId", i."MemberId", i."InvoiceNumber",
+    i."InvoiceDate", i."DueDate", i."TotalAmount", i."StatusId",
+    s."Code" AS "StatusCode", s."Name" AS "StatusName",
+    s."IsOverdue", s."IsClosed", m."Name" AS "MemberName"
+FROM public."Invoices" AS i
+LEFT JOIN public."InvoiceStatuses" AS s ON i."StatusId" = s."Id"
+LEFT JOIN public."Members" AS m ON i."MemberId" = m."Id";
+
+CREATE OR REPLACE VIEW access_reporting.v_payment_read AS
+SELECT p."Id" AS "PaymentId", p."MemberId", p."PaymentDate",
+       p."Amount", p."PayerName", p."Method"
+FROM public."Payments" AS p;
+
+CREATE OR REPLACE VIEW access_reporting.v_allocation_read AS
+SELECT a."Id" AS "AllocationId", a."PaymentId", a."InvoiceId", a."Amount"
+FROM public."PaymentAllocations" AS a;
+```
+
+既存Viewの`CREATE OR REPLACE VIEW`では、元列の順序・名前・型を維持し、追加列を末尾に配置する。今回 `v_invoice_read` の7列の後ろにStatus/Memberの5列を追加した。
+
+## 71.2 DBロール・権限
+
+```sql
+-- 未作成の場合のみDB管理者が実行
+CREATE ROLE access_readonly LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT CONNECT ON DATABASE invoicesystem TO access_readonly;
+GRANT USAGE ON SCHEMA access_reporting TO access_readonly;
+GRANT SELECT ON access_reporting.v_invoice_read,
+                access_reporting.v_payment_read,
+                access_reporting.v_allocation_read TO access_readonly;
+```
+
+パスワードは`psql`の `\password access_readonly` で対話的に設定し、SQL・Markdownには記載しない。既存ロールがある環境で`CREATE ROLE`を再実行しないこと。確認には `has_table_privilege` でViewのSELECTと書込権限を検査する。また、基底テーブルへのSELECT権限の有無も確認する。
+
+## 71.3 Accessリンクテーブル
+
+| View | Access側 | 識別子 |
+|---|---|---|
+| `v_invoice_read` | `L_Invoice` | `InvoiceId` |
+| `v_payment_read` | `L_Payment` | `PaymentId` |
+| `v_allocation_read` | `L_Allocation` | `AllocationId` |
+
+既設の `T_InvoiceImport` / `T_PaymentImport` / `T_AllocationImport` は維持する。ODBCリンクはAccessの「外部データ」から追加・再リンクする。PostgreSQL Viewに列を追加した後は、Access側でリンクを更新し列構成の反映を確認する。DSNのパスワード保存は行わない方針とする。
+
+## 71.4 Q_ODBC_InvoiceAllocationSummary
+
+```sql
+SELECT
+    I.InvoiceId, I.MemberId, I.InvoiceNumber,
+    I.InvoiceDate, I.DueDate, I.TotalAmount,
+    I.StatusCode, I.StatusName, I.IsOverdue, I.IsClosed, I.MemberName,
+    Nz(Sum(A.Amount), 0) AS AllocatedAmount,
+    I.TotalAmount - Nz(Sum(A.Amount), 0) AS RemainingAmount
+FROM L_Invoice AS I
+LEFT JOIN L_Allocation AS A ON I.InvoiceId = A.InvoiceId
+GROUP BY
+    I.InvoiceId, I.MemberId, I.InvoiceNumber,
+    I.InvoiceDate, I.DueDate, I.TotalAmount,
+    I.StatusCode, I.StatusName, I.IsOverdue, I.IsClosed, I.MemberName;
+```
+
+表示列は既設 `Q_InvoiceAllocationSummary` の13項目と対応する。Accessの集計処理では割当なしを `Nz(Sum(...),0)` で0として扱う。ODBCデータの日時・型の解釈とCSV取込後の日付表現の差に注意する。
+
+## 71.5 Q_ODBC_ValidationSummary
+
+```sql
+SELECT
+    Count(*) AS InvoiceCount,
+    Sum(TotalAmount) AS TotalInvoiceAmount,
+    Sum(AllocatedAmount) AS TotalAllocatedAmount,
+    Sum(RemainingAmount) AS TotalRemainingAmount,
+    Sum(IIf(RemainingAmount > 0, 1, 0)) AS UnpaidInvoiceCount,
+    Sum(IIf(RemainingAmount < 0, 1, 0)) AS OverAllocatedCount
+FROM Q_ODBC_InvoiceAllocationSummary;
+```
+
+UnpaidInvoiceCountは残額が正の請求件数（未入金・一部入金を含む）。TotalRemainingAmountは負の残額も含めた正味合計である。
+
+検証用PostgreSQL集計SQL：
+
+```sql
+WITH InvoiceSummary AS (
+  SELECT i."InvoiceId", i."TotalAmount" AS TotalAmount,
+         COALESCE(SUM(a."Amount"), 0) AS AllocatedAmount,
+         i."TotalAmount" - COALESCE(SUM(a."Amount"), 0) AS RemainingAmount
+  FROM access_reporting.v_invoice_read AS i
+  LEFT JOIN access_reporting.v_allocation_read AS a
+    ON i."InvoiceId" = a."InvoiceId"
+  GROUP BY i."InvoiceId", i."TotalAmount"
+)
+SELECT COUNT(*) AS "InvoiceCount",
+       SUM(TotalAmount) AS "TotalInvoiceAmount",
+       SUM(AllocatedAmount) AS "TotalAllocatedAmount",
+       SUM(RemainingAmount) AS "TotalRemainingAmount",
+       COUNT(*) FILTER (WHERE RemainingAmount > 0) AS "UnpaidInvoiceCount",
+       COUNT(*) FILTER (WHERE RemainingAmount < 0) AS "OverAllocatedCount"
+FROM InvoiceSummary;
+```
+
+## 71.6 Q_ODBC_CsvComparison
+
+```sql
+SELECT
+    C.InvoiceId,
+    C.InvoiceNumber,
+    C.TotalAmount AS CsvTotal,
+    O.TotalAmount AS OdbcTotal,
+    C.AllocatedAmount AS CsvAllocated,
+    O.AllocatedAmount AS OdbcAllocated,
+    C.RemainingAmount AS CsvRemaining,
+    O.RemainingAmount AS OdbcRemaining,
+    IIf(
+      O.InvoiceId Is Null, "ODBC側なし",
+      IIf(C.TotalAmount = O.TotalAmount
+          AND C.AllocatedAmount = O.AllocatedAmount
+          AND C.RemainingAmount = O.RemainingAmount,
+          "一致", "差異あり")
+    ) AS CheckResult
+FROM Q_InvoiceAllocationSummary AS C
+LEFT JOIN Q_ODBC_InvoiceAllocationSummary AS O ON C.InvoiceId = O.InvoiceId
+ORDER BY C.InvoiceId;
+```
+
+このクエリは**CSV取込側のInvoiceIdを母集団としたLEFT JOIN**であり、ODBC側のみに存在するレコードは比較しない。また、表示される`InvoiceNumber`は判定式に含まれない。両側のデータ時点・対象範囲が異なる場合は差異理由を別途確認する。
+
+## 71.7 確認済み結果と証跡
+
+| 検証 | 結果 | 証跡 |
+|---|---|---|
+| ODBC請求集計13列 | 全61件を表示 | `images/13-odbc-invoice-allocation.png` |
+| Accessの6項目集計 | 61 / 6,310,000 / 4,486,000 / 1,824,000 / 26 / 1 | `images/14-odbc-validation-summary.png` |
+| PostgreSQL同一集計 | 上記6項目すべて一致 | `images/15-postgresql-validation-summary.png` |
+| 既設CSV17件との比較 | 金額3項目を17件すべて「一致」、差異0 | `images/16-odbc-csv-comparison.png` |
+| 比較元CSVの請求照合 | 17件を確認 | `images/17-csv-invoice-allocation.png` |
+
+付帯確認：ODBC接続先5432の元データ件数はInvoice 61、Payment 108、Allocation 58。5433側は別DBであり、ODBCの実データ照合には使用しない。ロールでのView参照成功は確認したが、本書の証跡に**5432側でのUPDATE拒否の実操作ログは含まれない**。
+
+## 71.8 制約
+
+- Phase 2はローカルODBC/SQL検証として扱う。VPS上のDBにODBCで接続した証跡ではない。
+- 時点再現なし。特にAllocationの作成日時がないため、過去月時点の全状態を完全再現しない。
+- CSV 17件の金額3項目一致は、その17件に限る部分集合の検証結果であり、61件すべてや全13列の同値性を証明しない。
+- 認証情報を保存したACCDBの公開は行わない。リンクテーブル内に保存済みのパスワードがないか公開前に確認する。
+
+詳細・環境設定は [`04_odbc_readonly.md`](04_odbc_readonly.md) に記載する。
+
+---

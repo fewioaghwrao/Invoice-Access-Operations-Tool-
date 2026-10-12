@@ -6,7 +6,9 @@ Microsoft Access / VBA / Access SQL を利用した、**請求・入金データ
 
 Access から Invoice Management System の DB を直接更新することはありません。
 
-**Phase 1 は、Admin JWTログイン → Access Export API → ZIP/3CSV取得 → Access自動取込 → 照合 → 対象月集計 → 月次確認レポートまで実装・E2E動作確認済みです。**
+**Phase 1 完了：** Admin JWTログイン → Access Export API → ZIP/3CSV取得 → Access自動取込 → 照合 → 対象月集計 → 月次確認レポートまで実装・E2E動作確認済みです。
+
+**Phase 2 完了（ローカル検証）：** PostgreSQLの参照用View → SELECT専用DBロール → ODBCリンクテーブル → Access SQLによる集計 → PostgreSQL集計値6項目一致 → 既存CSV取込データ17件の金額3項目一致を確認しました。**Phase 1のCSV方式は維持**し、ODBCは参照・比較検証用の別経路として追加しています。
 
 ---
 
@@ -74,9 +76,9 @@ Invoice Management System には、請求・入金・入金割当を管理する
 └──────────────────────────────┘
 ```
 
-Access から Invoice DB へ直接接続しません。
+上図は **Phase 1 のAPI/CSV連携経路**です。Phase 1ではAccessからInvoice DBへ接続せず、APIが生成したZIP / CSVでデータを取り込みます。
 
-データ連携は Invoice API が生成した CSV / ZIP を介した **一方向連携**です。
+Phase 2では、ローカル検証環境に限って **PostgreSQLの参照用ViewをODBCで直接読み取る追加経路**を設けました。元テーブルへの直接SELECT権限や、DBへのINSERT/UPDATE/DELETE権限をAccess用ロールに付与しない設計です。両経路ともAccessからInvoice本体の正データを更新しません。
 
 ---
 
@@ -530,6 +532,78 @@ PaymentAmount : 400000
 
 ---
 
+## Phase 2：PostgreSQL ODBC参照・CSV照合検証（ローカル）
+
+既設のCSV取込を置き換えるのではなく、**参照専用ODBCリンクテーブルを追加し、SQL集計の検証に利用**します。2026年10月に以下の検証を実施しました。
+
+```text
+[経路A：従来の月次照合]
+ASP.NET Core API ─ JWT ─ ZIP/3CSV ─→ T_InvoiceImport / T_PaymentImport / T_AllocationImport
+                                              ↓
+                                      Q_InvoiceAllocationSummary
+
+[経路B：Phase 2の追加]
+PostgreSQL ─ access_reporting View ─ ODBC/SELECT専用 ─→ L_Invoice / L_Payment / L_Allocation
+                                              ↓
+                                      Q_ODBC_InvoiceAllocationSummary
+                                              ↓
+                                      Q_ODBC_ValidationSummary
+
+両経路の共通InvoiceIdを Q_ODBC_CsvComparison で比較
+```
+
+### PostgreSQLとAccessの対応
+
+| PostgreSQL側 | Access側 | 内容 |
+|---|---|---|
+| `access_reporting.v_invoice_read` | `L_Invoice` | 請求・ステータス・会員名の参照 |
+| `access_reporting.v_payment_read` | `L_Payment` | 入金の参照 |
+| `access_reporting.v_allocation_read` | `L_Allocation` | 割当の参照 |
+
+- DB：ローカルDockerの `invoice_postgres`、`invoicesystem`（Windowsからの検証用ポート：5432）
+- ドライバー：PostgreSQL Unicode(x64) / psqlODBC
+- ODBC DSN（開発PC内）：`InvoiceAccessDataLocal`、ユーザー：`access_readonly`
+- DB権限：`access_reporting` スキーマへの `USAGE`、3 Viewへの `SELECT`。基底テーブルへの直接参照・書込権限は与えない方針
+- DSN名、ポート、接続用パスワードは**ローカル環境固有**です。パスワードをREADME、設計書、Git、ODBC接続情報付きACCDBへ保存しないでください
+- PostgreSQLに対する更新・登録・削除は行いません。API/CSVは引き続き月次照合の本来の取込経路とします
+
+### 検証したAccessクエリ
+
+| クエリ | 用途 |
+|---|---|
+| `Q_ODBC_InvoiceAllocationSummary` | 13項目表示（既設CSV側と列構成を対応）、InvoiceId単位の割当・残額計算 |
+| `Q_ODBC_ValidationSummary` | 請求件数・請求総額・割当総額・正味残額・残額あり件数・過剰割当件数を集計 |
+| `Q_ODBC_CsvComparison` | CSV側のInvoiceIdを基準に、請求額・割当額・残額をODBC結果と比較 |
+
+### 実データによる検証結果
+
+| 集計項目 | Access ODBC | PostgreSQL | 判定 |
+|---|---:|---:|---|
+| InvoiceCount | 61 | 61 | 一致 |
+| TotalInvoiceAmount | 6,310,000 | 6,310,000 | 一致 |
+| TotalAllocatedAmount | 4,486,000 | 4,486,000 | 一致 |
+| TotalRemainingAmount | 1,824,000 | 1,824,000 | 一致 |
+| UnpaidInvoiceCount（残額が正の請求） | 26 | 26 | 一致 |
+| OverAllocatedCount（残額が負の請求） | 1 | 1 | 一致 |
+
+ODBC参照元DBの件数は Invoice 61件、Payment 108件、Allocation 58件です。CSV側の既存取込データ **17件** と同じ `InvoiceId` で比較した結果、**請求額・割当額・残額の3項目が17件すべて一致**しました（差異0件）。
+
+**比較範囲の制約：** ODBCはDBの現在データ全61件、CSV側は過去に取り込まれた17件です。今回はCSVに存在する17件を基準に比較したもので、全61件についてCSV連携との一致を検証したものではありません。請求番号、日付、ステータス、会員名の値の一致は今回の比較SQLでは判定していません。また、同一時刻に取得したスナップショットであることも確認していません。
+
+### 動作確認エビデンス
+
+| 証跡 | 内容 |
+|---|---|
+| ![ODBC請求照合](docs/images/13-odbc-invoice-allocation.png) | ODBCリンクテーブルを使った13項目の請求・割当集計（61件） |
+| ![ODBC集計](docs/images/14-odbc-validation-summary.png) | Accessの6項目集計 |
+| ![PostgreSQL集計](docs/images/15-postgresql-validation-summary.png) | PostgreSQLで同じ6項目を算出した結果 |
+| ![CSV比較](docs/images/16-odbc-csv-comparison.png) | CSV側17件の請求額・割当額・残額が一致 |
+| ![従来CSV照合](docs/images/17-csv-invoice-allocation.png) | 比較に使用した既存CSV側の照合結果 |
+
+DDL、ODBC設計、権限、検証SQL、制約の詳細は [`docs/04_odbc_readonly.md`](docs/04_odbc_readonly.md) に記載しています。
+
+---
+
 ## 使用技術
 
 ### Access 側
@@ -537,6 +611,8 @@ PaymentAmount : 400000
 - Microsoft Access
 - VBA
 - Access SQL
+- PostgreSQL ODBC（psqlODBC / Unicode x64、Phase 2）
+- SELECT専用リンクテーブル（Phase 2）
 - DAO / `CurrentDb`
 - `DoCmd.TransferText`
 - `WinHttp.WinHttpRequest.5.1`
@@ -629,7 +705,7 @@ Export 実行時点の現在データを、
 - Payment の登録・更新
 - PaymentAllocation の登録・更新
 - Invoice ステータス更新
-- Invoice DB への直接接続
+- Invoiceの元テーブルへの直接更新・直接参照（Phase 2の参照専用View経由の読取は対象内）
 - 月次締めロック
 - 会計仕訳
 - 過去任意日時の完全状態復元
@@ -639,7 +715,7 @@ Export 実行時点の現在データを、
 
 ## 今後の拡張候補
 
-Phase 1 の主要機能は完成しています。
+Phase 1の主要機能と、Phase 2のローカルODBC参照・照合検証は完了しています。
 
 今後の候補：
 
@@ -657,7 +733,8 @@ Phase 1 の主要機能は完成しています。
 |---|---|
 | [`docs/01_requirements.md`](docs/01_requirements.md) | 要件定義、対象範囲、照合要件、レポート要件、完成条件 |
 | [`docs/02_basic_design.md`](docs/02_basic_design.md) | API、ZIP / CSV、Access連携、対象月集計、月次レポート |
-| [`docs/03_detail_design.md`](docs/03_detail_design.md) | Endpoint / Service / DTO / VBA / Query / Report の詳細設計 |
+| [`docs/03_detail_design.md`](docs/03_detail_design.md) | Endpoint / Service / DTO / VBA / Query / Report の詳細設計、およびPhase 2の実装対応 |
+| [`docs/04_odbc_readonly.md`](docs/04_odbc_readonly.md) | Phase 2のODBC構成、PostgreSQL View/権限、照合SQLと動作確認結果 |
 
 ---
 
@@ -675,6 +752,7 @@ invoice-access-operations-tool/
    ├─ 01_requirements.md
    ├─ 02_basic_design.md
    ├─ 03_detail_design.md
+   ├─ 04_odbc_readonly.md
    │
    └─ images/
       ├─ 01-api-login.png
@@ -688,7 +766,12 @@ invoice-access-operations-tool/
       ├─ 09-target-month-invoices.png
       ├─ 10-target-month-payments.png
       ├─ 11-monthly-report.png
-      └─ 12-202702-import.png
+      ├─ 12-202702-import.png
+      ├─ 13-odbc-invoice-allocation.png
+      ├─ 14-odbc-validation-summary.png
+      ├─ 15-postgresql-validation-summary.png
+      ├─ 16-odbc-csv-comparison.png
+      └─ 17-csv-invoice-allocation.png
 ```
 
 ---
@@ -741,4 +824,4 @@ Access SQL
 VPS / Docker / nginx
 ```
 
-を組み合わせ、既存業務システムに対する **EUC / 月次照合ツールの設計・実装例**としてまとめています。
+を組み合わせ、既存業務システムに対する **EUC / 月次照合ツールの設計・実装例**としてまとめています。Phase 2ではこれに **PostgreSQL参照専用View / ODBCリンクテーブル / 2経路の集計比較**を追加しました。
