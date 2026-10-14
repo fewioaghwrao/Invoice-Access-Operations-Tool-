@@ -10,6 +10,8 @@ Access から Invoice Management System の DB を直接更新することはあ
 
 **Phase 2 完了（ローカル検証）：** PostgreSQLの参照用View → SELECT専用DBロール → ODBCリンクテーブル → Access SQLによる集計 → PostgreSQL集計値6項目一致 → 既存CSV取込データ17件の金額3項目一致を確認しました。**Phase 1のCSV方式は維持**し、ODBCは参照・比較検証用の別経路として追加しています。
 
+**Phase 3 検証完了（2026年10月・ローカル）：** `access_readonly` のView SELECT許可／元テーブルUPDATE・DELETE拒否を確認し、検証用ACCDBで入金過剰割当・請求ステータス不一致・キャンセル請求への割当・期日超過フラグ不一致の異常系テストを実施しました。**既存クエリと正データは変更せず、テスト用コピーのみを更新**しています。
+
 ---
 
 ## 概要
@@ -604,6 +606,50 @@ DDL、ODBC設計、権限、検証SQL、制約の詳細は [`docs/04_odbc_readon
 
 ---
 
+## Phase 3：読取専用権限・既存照合クエリの異常系検証（ローカル）
+
+Phase 2までの機能を維持したまま、2026年10月に**テスト用ACCDB（リポジトリ外の一時コピー）**とローカルPostgreSQLで検証しました。AccessからPostgreSQLの正データは更新していません。テスト用ACCDBで更新したのはCSV取込済みのローカルテーブルのみです。
+
+### PostgreSQLの権限検証
+
+- `has_table_privilege`：`access_readonly` に対するViewの `SELECT=True`、Viewの `UPDATE=False`、`public."Invoices"` の `SELECT/UPDATE/DELETE=False` を確認。
+- `BEGIN` → `SET LOCAL ROLE access_readonly` → `UPDATE ... WHERE FALSE` / `DELETE ... WHERE FALSE` で、いずれも `permission denied for table Invoices` を確認。
+- 同ロールで `access_reporting.v_invoice_read` の `SELECT COUNT(*) = 61` を確認し、各テスト後に `ROLLBACK` を実行。
+
+※ローカル管理者のpsqlセッションでロールを切り替えた検証であり、ODBC認証による接続や本番環境での更新拒否試験を実施したという意味ではありません。
+
+### Access異常系テスト
+
+| 対象クエリ | テスト条件 | 確認結果 |
+|---|---|---|
+| `Q_PaymentOverAllocation` | PaymentId=1 の入金額を120,000→119,000円に変更 | 0→1件、過剰1,000円を検出 |
+| `Q_PaymentOverAllocation` | 同入金額を119,999円（1円超過）に変更 | 1件、`UnallocatedAmount=-1` を検出 |
+| `Q_StatusMismatch` | 全額入金済みInvoiceId=1 の `PAID→UNPAID` | 1件、計算結果 `PAID` と不一致 |
+| `Q_StatusMismatch` | 未入金InvoiceId=10 の `UNPAID→PAID` | 1件、計算結果 `UNPAID` と不一致 |
+| `Q_StatusMismatch` | 一部入金InvoiceId=12 の `PARTIAL→PAID` | 1件、計算結果 `PARTIAL` と不一致 |
+| `Q_CancelledWithAllocation` | 割当30,000円のInvoiceId=12を `PARTIAL→CANCELLED` | 0→1件、キャンセル請求への割当を検出 |
+| `Q_PastDueMismatch` | InvoiceId=10 の `IsOverdue=False→True` | 既存5→6件、計算結果 `False` と不一致 |
+
+検証後、変更したダミーデータは開発者により元の値へ復元済みです。`Q_PastDueMismatch` の検出件数は**0件ではなく、検証前・復元後とも5件**です。
+
+**既知の課題：** `Q_PastDueMismatch` は期日比較の基準日 `#2026/10/01#` をSQLに固定しています。2026年11月以降のダミーデータに `IsOverdue=True` が存在するため、元から5件の不一致が表示されます。これは検出機能のテストと、業務上の期日超過判定の正しさを区別して扱う必要があります。将来は照合対象年月／基準日を明示したルールへの整理が必要です。
+
+### Phase 3エビデンス（抜粋）
+
+| 検証 | 証跡 |
+|---|---|
+| ロール権限とSELECT | ![権限確認](docs/images/18-phase3-db-privileges.png) |
+| UPDATE・DELETE拒否、View 61件取得 | ![拒否検証](docs/images/19-phase3-db-denial.png) |
+| 入金過剰割当1,000円 | ![過剰割当](docs/images/23-phase3-payment-overallocation-1000.png) |
+| 入金過剰割当1円 | ![境界値](docs/images/24-phase3-payment-overallocation-1.png) |
+| 全額入金済みなのにUNPAID | ![ステータス不一致](docs/images/25-phase3-status-paid-as-unpaid.png) |
+| キャンセル済み請求への割当 | ![取消請求](docs/images/28-phase3-cancelled-allocation.png) |
+| 期日超過フラグ不一致（5→6件） | ![期日超過差異](docs/images/30-phase3-overdue-after.png) |
+
+テストケース、手順、復元SQL、全エビデンスと未検証範囲は [`docs/05_phase3_validation.md`](docs/05_phase3_validation.md) を参照してください。
+
+---
+
 ## 使用技術
 
 ### Access 側
@@ -715,7 +761,7 @@ Export 実行時点の現在データを、
 
 ## 今後の拡張候補
 
-Phase 1の主要機能と、Phase 2のローカルODBC参照・照合検証は完了しています。
+Phase 1の主要機能、Phase 2のローカルODBC参照・照合検証、およびPhase 3の読取専用権限・異常系検証は完了しています。
 
 今後の候補：
 
@@ -723,6 +769,7 @@ Phase 1の主要機能と、Phase 2のローカルODBC参照・照合検証は�
 - CSV 取込履歴の世代管理
 - 取込日時・対象年月の履歴保存
 - `Q_CheckResult` への追加判定統合
+- `Q_PastDueMismatch` の固定基準日を対象年月／照合基準日に基づく仕様へ見直す（既存5件の差異理由も再評価）
 - レポートのPDF出力等、運用向け出力機能
 
 ---
@@ -735,6 +782,7 @@ Phase 1の主要機能と、Phase 2のローカルODBC参照・照合検証は�
 | [`docs/02_basic_design.md`](docs/02_basic_design.md) | API、ZIP / CSV、Access連携、対象月集計、月次レポート |
 | [`docs/03_detail_design.md`](docs/03_detail_design.md) | Endpoint / Service / DTO / VBA / Query / Report の詳細設計、およびPhase 2の実装対応 |
 | [`docs/04_odbc_readonly.md`](docs/04_odbc_readonly.md) | Phase 2のODBC構成、PostgreSQL View/権限、照合SQLと動作確認結果 |
+| [`docs/05_phase3_validation.md`](docs/05_phase3_validation.md) | Phase 3の権限拒否検証、Access異常系、復元記録、エビデンスと課題 |
 
 ---
 
@@ -753,6 +801,7 @@ invoice-access-operations-tool/
    ├─ 02_basic_design.md
    ├─ 03_detail_design.md
    ├─ 04_odbc_readonly.md
+   ├─ 05_phase3_validation.md
    │
    └─ images/
       ├─ 01-api-login.png
@@ -771,7 +820,20 @@ invoice-access-operations-tool/
       ├─ 14-odbc-validation-summary.png
       ├─ 15-postgresql-validation-summary.png
       ├─ 16-odbc-csv-comparison.png
-      └─ 17-csv-invoice-allocation.png
+       ├─ 17-csv-invoice-allocation.png
+       ├─ 18-phase3-db-privileges.png
+       ├─ 19-phase3-db-denial.png
+       ├─ 20-phase3-payment-overallocation-baseline.png
+       ├─ 21-phase3-payment-summary.png
+       ├─ 22-phase3-payment-targets.png
+       ├─ 23-phase3-payment-overallocation-1000.png
+       ├─ 24-phase3-payment-overallocation-1.png
+       ├─ 25-phase3-status-paid-as-unpaid.png
+       ├─ 26-phase3-status-unpaid-as-paid.png
+       ├─ 27-phase3-status-partial-as-paid.png
+       ├─ 28-phase3-cancelled-allocation.png
+       ├─ 29-phase3-overdue-before.png
+       └─ 30-phase3-overdue-after.png
 ```
 
 ---
@@ -824,4 +886,4 @@ Access SQL
 VPS / Docker / nginx
 ```
 
-を組み合わせ、既存業務システムに対する **EUC / 月次照合ツールの設計・実装例**としてまとめています。Phase 2ではこれに **PostgreSQL参照専用View / ODBCリンクテーブル / 2経路の集計比較**を追加しました。
+を組み合わせ、既存業務システムに対する **EUC / 月次照合ツールの設計・実装例**としてまとめています。Phase 2では **PostgreSQL参照専用View / ODBCリンクテーブル / 2経路の集計比較**を追加しました。Phase 3では、実装を変更せず**アクセス権限の拒否検証と既存照合クエリの異常系テスト**を実施し、検証手順・結果・制約を文書化しました。
