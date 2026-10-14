@@ -905,8 +905,44 @@ Phase 1の「Invoice DBへの直接接続は対象外」とした要件はPhase 
 - ODBC参照を月次CSV業務フローの必須経路へ変更すること
 - 過去任意日時の会計状態の完全再現
 - 大量データ性能試験、DB切断・障害時の網羅的復旧試験
-- 元DBに対する更新拒否の実操作による本番相当試験（DB権限検査・SELECT接続は別途確認）
+- 元DBに対する更新拒否の**本番相当試験**（ローカル環境の `SET LOCAL ROLE` による拒否検証は後続のPhase 3で実施）
 
 実装詳細は [`04_odbc_readonly.md`](04_odbc_readonly.md) を参照する。
 
 ---
+# 23. Phase 3：権限制御・照合異常系検証要件（2026年10月）
+
+## 23.1 目的・対象範囲
+
+Phase 3ではPhase 1・2の本体機能を変更せず、既存Access SQLの異常検出と、PostgreSQL参照専用DBロールのアクセス制御が期待どおり動くことを**ローカル検証**する。請求・入金の正データへの更新は行わない。
+
+## 23.2 検証要件
+
+1. PostgreSQL `access_readonly` から対象ViewのSELECTが許可されること。
+2. 同ロールから元テーブルへの直接SELECT、UPDATE、DELETE、およびViewへのUPDATEが許可されないことを権限情報で確認すること。
+3. 元テーブルに対するUPDATE/DELETEを、`WHERE FALSE`を付けた操作とロール切替で実行し、権限拒否の応答を確認すること。
+4. `Q_PaymentOverAllocation` が入金額を1,000円・1円超える割当を検出できること。
+5. `Q_StatusMismatch` が全額入金／未入金／一部入金の3パターンのステータス矛盾を検出できること。
+6. `Q_CancelledWithAllocation` がキャンセル済み請求への入金割当を検出できること。
+7. `Q_PastDueMismatch` が既存の基準日ロジックに対するIsOverdueの意図的な不一致を検出できること。
+8. Accessのデータ変更はリポジトリ外に複製した `.accdb` 内のダミー取込テーブルに限定し、各ケースの確認後に元へ復元すること。
+9. 実行結果、検証前の基準値、検証後の件数、未検証事項を資料へ記録すること。
+
+## 23.3 確認済み結果
+
+| 項目 | ローカルでの確認結果 |
+|---|---|
+| PostgreSQL権限 | View SELECT許可、View UPDATE不可、元Invoices SELECT/UPDATE/DELETE不可 |
+| 権限拒否の実操作 | 元Invoices UPDATE/DELETEとも `permission denied`、View COUNT=61 |
+| 入金額超過割当 | 正常0件→過剰1,000円で1件、1円超過でも1件 |
+| ステータス矛盾 | PAID→UNPAID、UNPAID→PAID、PARTIAL→PAIDの各ケースを1件検出 |
+| キャンセル済み請求 | CANCELLEDかつ割当30,000円を1件検出 |
+| 期日超過フラグ | 基準5件→フラグ変更により6件、復元後5件（開発者確認） |
+
+## 23.4 制約・対象外
+
+- `Q_PastDueMismatch` のSQLは `#2026/10/01#` 固定であり、既存5件は基準日とテストデータ上のIsOverdueの意味・時点が一致しない可能性がある。ロジックの不一致検出は確認したが、業務上の期日超過判定の妥当性を証明したものではない。
+- 権限拒否はpsqlの管理者セッションで `SET LOCAL ROLE access_readonly` を実施した結果であり、ODBC認証そのものや本番環境での権限試験ではない。
+- 他のすべての照合クエリ、CSV取込エラー／通信障害／性能、同時更新などの網羅的な品質保証は対象外とする。
+
+詳細結果・復元手順・証跡は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。

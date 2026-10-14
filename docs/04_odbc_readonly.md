@@ -131,12 +131,19 @@ WindowsのDSN設定は通常 `.accdb` へ同梱されないが、**DSN側にパ�
 - CSVの取得時点とODBCの参照時点が厳密に同一であることも未確認。
 - ODBCは全件直接参照、API/CSVは指定対象月までの累積データを抽出する。共通InvoiceId以外の直接比較は対象集合を揃える必要がある。
 - APIの過去月基準は割当履歴を完全に再現するものではない。新たな会計スナップショット機能を実装したわけではない。
-- ODBCの本番接続・5432側の明示的なUPDATE拒否操作・大量データ性能/障害系試験は別課題とする。
+- ODBCの本番接続・大量データ性能/障害系試験は別課題とする。5432側のローカルDBについては、**Phase 3で `SET LOCAL ROLE access_readonly` によるUPDATE/DELETE拒否操作を追加検証済み**（ODBCログインや本番環境の操作試験とは別）。
 - `invoice_postgres` のポート5432の公開範囲制限、およびWindows側DSNのパスワード保存有無の確認は別途実施する。
 
-## 11. 関連資料
+## 11. 後続検証：Phase 3（2026年10月）
+
+Phase 2の読取専用設計について、後続のPhase 3でローカルPostgreSQL `invoice_postgres` に対する実操作検証を追加した。`access_readonly` のView `SELECT` は許可、`public."Invoices"` の `SELECT/UPDATE/DELETE` とView `UPDATE` は不許可。`SET LOCAL ROLE access_readonly` による `UPDATE/DELETE ... WHERE FALSE` は権限エラーで拒否され、ViewのCOUNTは61件を返した。
+
+同時に既存のCSV取込テーブルを使う照合クエリについて、異常系と復元を検証している。元DBに異常データを入れたわけではない。詳細は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。
+
+## 12. 関連資料
 
 - [`01_requirements.md`](01_requirements.md) — Phase 2追加要件
 - [`02_basic_design.md`](02_basic_design.md) — Phase 2基本設計
 - [`03_detail_design.md`](03_detail_design.md) — View/権限とAccess SQLの詳細
+- [`05_phase3_validation.md`](05_phase3_validation.md) — ローカル権限拒否・既存照合SQLの異常系検証
 - [`../README.md`](../README.md) — 機能・エビデンス概要

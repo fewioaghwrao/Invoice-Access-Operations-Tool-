@@ -1602,3 +1602,40 @@ CSV側に存在する17件について、請求額・割当額・残額を照合
 詳細は [`04_odbc_readonly.md`](04_odbc_readonly.md) を参照する。
 
 ---
+# 46. Phase 3：ローカル異常系・読取専用権限検証 基本設計（2026年10月）
+
+## 46.1 方針とシステム境界
+
+- Phase 1のAPI/CSV取込、Phase 2のODBC参照経路は**変更しない**。
+- PostgreSQLに対しては `invoice_postgres` / `invoicesystem` の `access_readonly` ロールを使用した権限検査を実施する。
+- Accessの書換え対象は `%TEMP%\InvoiceAccessOperations-Phase3-Test.accdb` の取込テーブルに限定する。ODBCリンクテーブルと正データの変更は行わない。
+- 各ケースは「正常時の件数 → 条件を意図的に崩した時の抽出件数 → 復元」を確認する。スクリーンショットと開発者による復元確認を区別して記録する。
+
+## 46.2 DBロール権限の試験設計
+
+| 対象 | 権限・操作 | 期待結果 |
+|---|---|---|
+| `access_reporting.v_invoice_read` | SELECT | 許可、61件取得 |
+| `access_reporting.v_invoice_read` | UPDATE権限 | 不許可 |
+| `public."Invoices"` | SELECT/UPDATE/DELETE権限 | すべて不許可 |
+| `public."Invoices"` | UPDATE/DELETE ... WHERE FALSE | `permission denied`、実データ変更なし |
+
+検証は `BEGIN`、`SET LOCAL ROLE access_readonly`、対象SQL、`ROLLBACK` を単位とし、管理者権限のままSQLが実行されないよう `current_user` を確認する。結果は**ローカルロール切替**の証跡として扱い、実際のODBC経由の操作と混同しない。
+
+## 46.3 Access異常系試験設計
+
+| クエリ | テストで変更する列・条件 | 期待結果 |
+|---|---|---|
+| `Q_PaymentOverAllocation` | PaymentId=1のAmount=119000（割当120000） | 0→1件、超過1,000円 |
+| `Q_PaymentOverAllocation` | Amount=119999（割当120000） | 1件、超過1円 |
+| `Q_StatusMismatch` | InvoiceId=1のStatusCode=UNPAID（本来PAID） | 1件、CalculatedStatus=PAID |
+| `Q_StatusMismatch` | InvoiceId=10のStatusCode=PAID（本来UNPAID） | 1件、CalculatedStatus=UNPAID |
+| `Q_StatusMismatch` | InvoiceId=12のStatusCode=PAID（本来PARTIAL） | 1件、CalculatedStatus=PARTIAL |
+| `Q_CancelledWithAllocation` | InvoiceId=12をCANCELLED（割当30,000） | 0→1件 |
+| `Q_PastDueMismatch` | InvoiceId=10のIsOverdue=True | 5→6件（CalculatedIsOverdue=False） |
+
+## 46.4 固定基準日の課題
+
+`Q_PastDueMismatch` は `DueDate < #2026/10/01# AND AllocatedAmount < TotalAmount` で計算している。請求が2026年11月以降のダミーデータでは、`IsOverdue=True` の請求があってもこの基準日による再計算はFalseとなり、**元から5件の不一致**が存在する。Phase 3のテストは5件→6件→5件の差分のみを検証し、既存5件の業務的な異常性まで保証しない。基準日を対象月・評価時点に合わせる仕様は後続検討とする。
+
+試験結果・証跡は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。

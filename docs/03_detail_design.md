@@ -2220,3 +2220,162 @@ ORDER BY C.InvoiceId;
 詳細・環境設定は [`04_odbc_readonly.md`](04_odbc_readonly.md) に記載する。
 
 ---
+# 72. Phase 3：異常系・DB権限試験 詳細手順（2026年10月）
+
+## 72.1 テスト環境の分離
+
+リポジトリの `access/InvoiceAccessOperations.accdb` は変更しない。Accessを終了してから検証用コピーを作成し、そのコピーを起動する。
+
+```powershell
+Copy-Item ".\access\InvoiceAccessOperations.accdb" "$env:TEMP\InvoiceAccessOperations-Phase3-Test.accdb"
+Invoke-Item "$env:TEMP\InvoiceAccessOperations-Phase3-Test.accdb"
+```
+
+SQL更新は `T_PaymentImport` / `T_InvoiceImport` のみで、`L_*` リンクテーブルには更新SQLを発行しない。再取込はテストデータを上書きするため実施しない。
+
+## 72.2 PostgreSQL権限・拒否検証
+
+psqlで `invoice_postgres` / `invoicesystem` に接続し、`access_readonly` の権限を確認する。
+
+```sql
+SELECT
+    has_table_privilege('access_readonly','access_reporting.v_invoice_read','SELECT') AS view_select,
+    has_table_privilege('access_readonly','access_reporting.v_invoice_read','UPDATE') AS view_update,
+    has_table_privilege('access_readonly','public."Invoices"','SELECT') AS base_select,
+    has_table_privilege('access_readonly','public."Invoices"','UPDATE') AS base_update,
+    has_table_privilege('access_readonly','public."Invoices"','DELETE') AS base_delete;
+```
+
+結果：`t / f / f / f / f`。
+
+```sql
+BEGIN;
+SET LOCAL ROLE access_readonly;
+SELECT current_user;
+UPDATE public."Invoices" SET "TotalAmount" = 0 WHERE FALSE;
+ROLLBACK;
+```
+
+`current_user` = `access_readonly`、`ERROR: permission denied for table Invoices` を確認。
+
+```sql
+BEGIN;
+SET LOCAL ROLE access_readonly;
+DELETE FROM public."Invoices" WHERE FALSE;
+ROLLBACK;
+```
+
+こちらも同じ権限エラーを確認。
+
+```sql
+BEGIN;
+SET LOCAL ROLE access_readonly;
+SELECT COUNT(*) AS invoice_count FROM access_reporting.v_invoice_read;
+ROLLBACK;
+```
+
+SELECTは61件で成功。`WHERE FALSE` と `ROLLBACK` を併用しているため元DBのデータ変更は残さない。ロール切替の検証であり、ODBC接続元のログイン試験ではない。
+
+## 72.3 Q_PaymentOverAllocationの異常系
+
+判定SQLは `AllocatedAmount > PaymentAmount`。元データ（PaymentId=1）は `Amount=120000`、`AllocatedAmount=120000`。
+
+```sql
+UPDATE T_PaymentImport
+SET [Amount] = 119000
+WHERE [PaymentId] = 1 AND [Amount] = 120000;
+```
+
+1,000円超過の1件を検出した後、境界値を検証する。
+
+```sql
+UPDATE T_PaymentImport
+SET [Amount] = 119999
+WHERE [PaymentId] = 1 AND [Amount] = 119000;
+```
+
+1円超過の1件（`UnallocatedAmount=-1`）を確認。
+
+```sql
+UPDATE T_PaymentImport
+SET [Amount] = 120000
+WHERE [PaymentId] = 1 AND [Amount] = 119999;
+```
+
+## 72.4 Q_StatusMismatchの3パターン
+
+`CalculatedStatus` は割当金額と請求金額の比較で `UNPAID` / `PARTIAL` / `PAID` / `OVER_ALLOCATED` を算出する。`StatusCode IN ('UNPAID','PARTIAL','PAID')` のレコードのみ登録値との差を検出する。
+
+```sql
+-- 全額入金済みなのに未入金
+UPDATE T_InvoiceImport SET StatusCode='UNPAID'
+WHERE InvoiceId=1 AND StatusCode='PAID';
+-- 復元
+UPDATE T_InvoiceImport SET StatusCode='PAID'
+WHERE InvoiceId=1 AND StatusCode='UNPAID';
+```
+
+```sql
+-- 未入金なのに入金済み
+UPDATE T_InvoiceImport SET StatusCode='PAID'
+WHERE InvoiceId=10 AND StatusCode='UNPAID';
+-- 復元
+UPDATE T_InvoiceImport SET StatusCode='UNPAID'
+WHERE InvoiceId=10 AND StatusCode='PAID';
+```
+
+```sql
+-- 一部入金なのに全額入金済み
+UPDATE T_InvoiceImport SET StatusCode='PAID'
+WHERE InvoiceId=12 AND StatusCode='PARTIAL';
+-- 復元
+UPDATE T_InvoiceImport SET StatusCode='PARTIAL'
+WHERE InvoiceId=12 AND StatusCode='PAID';
+```
+
+3ケースすべて1件を検出。`StatusName` は元のままとし、**今回はStatusCodeと計算ステータスの比較に限定**する。StatusCode/StatusName間の整合性まで検証したわけではない。
+
+## 72.5 Q_CancelledWithAllocation
+
+```sql
+UPDATE T_InvoiceImport SET StatusCode='CANCELLED'
+WHERE InvoiceId=12 AND StatusCode='PARTIAL';
+```
+
+InvoiceId=12について、`StatusCode='CANCELLED'` / `AllocatedAmount=30000` の1件を検出。
+
+```sql
+UPDATE T_InvoiceImport SET StatusCode='PARTIAL'
+WHERE InvoiceId=12 AND StatusCode='CANCELLED';
+```
+
+## 72.6 Q_PastDueMismatch
+
+現行クエリの判定式は次のとおり。
+
+```sql
+IIf(Q.DueDate < #2026/10/01#
+    AND Q.AllocatedAmount < Q.TotalAmount, True, False)
+```
+
+変更前から5件の不一致がある。InvoiceId=10（DueDate=2027/01/25、AllocatedAmount=0、IsOverdue=False）を対象に、検証用ACCDBでフラグのみ変更する。
+
+```sql
+UPDATE T_InvoiceImport SET IsOverdue=True
+WHERE InvoiceId=10 AND IsOverdue=False;
+```
+
+6件への増加を確認。テスト後、次を実行して開発者により5件へ戻ったことが確認されている。
+
+```sql
+UPDATE T_InvoiceImport SET IsOverdue=False
+WHERE InvoiceId=10 AND IsOverdue=True;
+```
+
+この試験は固定基準日の不一致判定の動作確認であり、2026年11月以降の請求を2026/10/01時点で「期限超過」と扱う業務妥当性の試験ではない。
+
+## 72.7 完了判定と証跡
+
+権限拒否・各検出が期待どおりで、Accessテストデータは復元済み（開発者報告）。正式ACCDBのQuery/VBAやDB元テーブルのデータは本テストでは変更しない。テスト用ACCDBの修正分は公開版へマージしない。
+
+詳細な一覧と証跡の対応は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。
