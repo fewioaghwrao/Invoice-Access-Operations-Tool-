@@ -288,3 +288,10 @@ WHERE InvoiceId=10 AND IsOverdue=True;
 - [`03_detail_design.md`](03_detail_design.md) — 更新・復元SQLとPostgreSQL検証SQL
 - [`04_odbc_readonly.md`](04_odbc_readonly.md) — Phase 2の元のODBC設計・制約
 - [`../README.md`](../README.md) — 全体構成と実装状況
+
+
+---
+
+## 9. 後続対応：Phase 4
+
+本書の `Q_PastDueMismatch` に関する固定基準日 `#2026/10/01#`・元5件という記載は**Phase 3実施当時の結果**として保持する。後続のPhase 4では、対象月末を動的に算出する `Q_PastDueAsOfMonth` と `Q_PastDueMismatchAsOfMonth` を追加し、2027年2月のダミーデータで新基準の不一致3件を確認した。比較基準の変更であり、Phase 3の結果を書き換えるものではない。詳細は [`06_phase4_pastdue.md`](06_phase4_pastdue.md)。

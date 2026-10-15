@@ -946,3 +946,47 @@ Phase 3ではPhase 1・2の本体機能を変更せず、既存Access SQLの異�
 - 他のすべての照合クエリ、CSV取込エラー／通信障害／性能、同時更新などの網羅的な品質保証は対象外とする。
 
 詳細結果・復元手順・証跡は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。
+
+---
+
+# 24. Phase 4：月末基準の期日超過判定改善（2026年10月）
+
+## 24.1 目的と対象
+
+Phase 3で検証した旧 `Q_PastDueMismatch` は `#2026/10/01#` を固定基準日に使用していた。Phase 4はこの基準日問題を改善し、**選択中の `TargetYear` / `TargetMonth` に対応する月末を用いて期日超過候補と登録フラグの差異を確認する**。Phase 1～3のAPI・CSV取込およびPostgreSQLのデータ・権限は変更しない。
+
+要件対象はAccessのローカルImport Tableを用いた集計クエリ、`Q_MonthlySummary`、`R_MonthlyCheck` のみとする。
+
+## 24.2 機能要件
+
+1. `TempVars!TargetYear` / `TempVars!TargetMonth` から対象月末日を動的に算出できること。
+2. **期日当日は期限超過に含めない**。日付型の `DueDate < TargetMonthEnd` を採用する。
+3. 請求発生日が対象月末までの請求を対象とし、`StatusCode="CANCELLED"` を除外する。
+4. CSV取込からの `Q_InvoiceAllocationSummary.RemainingAmount > 0` を未払残額ありと判定し、月末より前の期日かつ未払残額ありの場合に `CalculatedIsOverdue=True` とする。
+5. `IsOverdue`（Invoice側のステータス由来）と `CalculatedIsOverdue`（Access側の月末判定）を**区別して表示**し、不一致を確認候補として抽出する。
+6. 判定計算の `Q_PastDueAsOfMonth` と、不一致抽出の `Q_PastDueMismatchAsOfMonth` を分離する。
+7. 旧 `Q_PastDueMismatch` はPhase 3の比較・履歴確認用として残し、`Q_MonthlySummary.PastDueMismatchCount` には新しい不一致クエリの件数を採用する。
+8. `Q_MonthlySummary` を参照する `R_MonthlyCheck` に、対象月末基準の不一致件数が表示されること。
+
+## 24.3 検証結果（2027年2月・ダミーデータ）
+
+| 検証項目 | 確認結果 |
+|---|---|
+| 対象年月・基準日 | 2027年2月・2027/02/28 |
+| `Q_PastDueAsOfMonth` | 17件表示 |
+| 旧 `Q_PastDueMismatch` | 5件（2026/10/01固定基準日） |
+| 新 `Q_PastDueMismatchAsOfMonth` | 3件：InvoiceId=10,12,16 |
+| 月末当日の境界条件 | 開発者による正常実行の報告あり（専用画像は未添付） |
+| `Q_MonthlySummary.PastDueMismatchCount` | 3件 |
+| `R_MonthlyCheck` | 2027年2月の月次レポートに3件を表示 |
+
+5件→3件は基準日の変更に伴う**比較結果の変化**であり、元データの2件が修正されたことは意味しない。
+
+## 24.4 制約と対象外
+
+- `IsOverdue` は取込時点の登録ステータス由来の属性であり、指定月末時点の履歴状態を保証しない。したがって3件は**状態不一致の確認候補**であり、不正データ確定ではない。
+- PaymentAllocationの割当履歴日時を持たず、任意の過去月末時点の未払残額を完全には再現できない。今回の残額は取込済みデータに基づく現在の割当再計算値である。
+- `TempVars` を未設定にした場合のエラーハンドリング、他の対象年月、末日支払期限の実請求データを用いた境界試験、`Q_CheckResult` の参照先の完全統一は今回の動作証跡の対象外。
+- 検証に使用した2027年2月は、実施日（2026年10月）からみて将来月の**ダミーデータによる計算確認**である。
+
+SQL、確認結果、エビデンスは [`06_phase4_pastdue.md`](06_phase4_pastdue.md) を参照する。

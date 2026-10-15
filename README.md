@@ -12,6 +12,8 @@ Access から Invoice Management System の DB を直接更新することはあ
 
 **Phase 3 検証完了（2026年10月・ローカル）：** `access_readonly` のView SELECT許可／元テーブルUPDATE・DELETE拒否を確認し、検証用ACCDBで入金過剰割当・請求ステータス不一致・キャンセル請求への割当・期日超過フラグ不一致の異常系テストを実施しました。**既存クエリと正データは変更せず、テスト用コピーのみを更新**しています。
 
+**Phase 4 検証完了（2026年10月・Accessローカル）：** 期日超過判定の固定基準日を見直し、対象年月から月末を算出する `Q_PastDueAsOfMonth` と `Q_PastDueMismatchAsOfMonth` を追加。2027年2月のダミーデータでは、旧固定日付方式5件に対して新方式は3件を抽出し、`Q_MonthlySummary`／`R_MonthlyCheck` で3件の表示を確認しました。3件は**確認候補**であり、過去月末の正確な状態復元を意味しません。
+
 ---
 
 ## 概要
@@ -391,7 +393,7 @@ UnallocatedAmount
 | PaymentCount | `Q_TargetMonthPayments` |
 | PaymentAmount | `Q_TargetMonthPayments` |
 
-照合件数は取込スナップショット全体の確認 Query を参照します。
+照合件数は取込スナップショット全体の確認 Query を参照します。**Phase 4では `PastDueMismatchCount` のみ `Q_PastDueMismatchAsOfMonth` を使用し、指定された対象年月末を基準とする**方式に変更しました。
 
 ```text
 UnpaidCount
@@ -632,7 +634,7 @@ Phase 2までの機能を維持したまま、2026年10月に**テスト用ACCDB
 
 検証後、変更したダミーデータは開発者により元の値へ復元済みです。`Q_PastDueMismatch` の検出件数は**0件ではなく、検証前・復元後とも5件**です。
 
-**既知の課題：** `Q_PastDueMismatch` は期日比較の基準日 `#2026/10/01#` をSQLに固定しています。2026年11月以降のダミーデータに `IsOverdue=True` が存在するため、元から5件の不一致が表示されます。これは検出機能のテストと、業務上の期日超過判定の正しさを区別して扱う必要があります。将来は照合対象年月／基準日を明示したルールへの整理が必要です。
+**既知の課題：** `Q_PastDueMismatch` は期日比較の基準日 `#2026/10/01#` をSQLに固定しています。2026年11月以降のダミーデータに `IsOverdue=True` が存在するため、元から5件の不一致が表示されます。これは検出機能のテストと、業務上の期日超過判定の正しさを区別して扱う必要があります。**この記述はPhase 3時点の課題です。** 後続Phase 4で対象年月末による再計算Queryを追加し、月次サマリーへ反映しています。
 
 ### Phase 3エビデンス（抜粋）
 
@@ -647,6 +649,52 @@ Phase 2までの機能を維持したまま、2026年10月に**テスト用ACCDB
 | 期日超過フラグ不一致（5→6件） | ![期日超過差異](docs/images/30-phase3-overdue-after.png) |
 
 テストケース、手順、復元SQL、全エビデンスと未検証範囲は [`docs/05_phase3_validation.md`](docs/05_phase3_validation.md) を参照してください。
+
+---
+
+## Phase 4：期日超過判定の対象月末基準化（Accessローカル検証）
+
+Phase 3で残課題だった `Q_PastDueMismatch` の固定基準日 `#2026/10/01#` を見直しました。既存の固定日付Queryは比較用に残し、対象月末に応じて計算するQueryを追加しています。
+
+```text
+TempVars(TargetYear, TargetMonth)
+  ↓
+Q_InvoiceAllocationSummary
+  ↓
+Q_PastDueAsOfMonth（期日・残額から判定を計算）
+  ↓
+Q_PastDueMismatchAsOfMonth（登録IsOverdueとの比較）
+  ↓
+Q_MonthlySummary.PastDueMismatchCount
+  ↓
+R_MonthlyCheck
+```
+
+**判定：** `DueDate < TargetMonthEnd` かつ `RemainingAmount > 0`。期限当日は超過扱いせず、`CANCELLED` は対象外とします。`IsOverdue` はInvoice側の登録済みステータス由来、`CalculatedIsOverdue` はAccessが対象月末基準で求めた候補フラグです。
+
+### 2027年2月ダミーデータでの検証
+
+| 確認項目 | 結果 |
+|---|---|
+| 判定基準日 | 2027/02/28 |
+| 新 `Q_PastDueAsOfMonth` | 17件表示 |
+| 旧 `Q_PastDueMismatch` | 5件 |
+| 新 `Q_PastDueMismatchAsOfMonth` | **3件（InvoiceId 10・12・16）** |
+| `Q_MonthlySummary` | 期日超過不一致3件（請求4件／450,000円、入金5件／400,000円） |
+| `R_MonthlyCheck` | 2027年2月の期日超過不一致3件を表示 |
+| 月末当日の境界値 | 開発者による正常動作報告あり（専用画像なし） |
+
+![月末基準17件](docs/images/32-phase4-monthend-calculation.png)
+
+![新基準の不一致3件](docs/images/33-phase4-mismatch-after-boundary-rule.png)
+
+![月次サマリー](docs/images/34-phase4-monthly-summary.png)
+
+![月次確認レポート](docs/images/35-phase4-monthly-report.png)
+
+**留意点：** 旧5件と新3件は評価条件の変更に伴う差であり、元のデータを修正して不一致が2件減ったわけではありません。また、PaymentAllocationの履歴日時を持たず、現在の取込内容から過去月末の未払残額を完全に再現できません。新3件は業務担当者が確認する**差異候補**です。
+
+SQL全文、境界条件、エビデンスと残課題は [`docs/06_phase4_pastdue.md`](docs/06_phase4_pastdue.md) を参照してください。
 
 ---
 
@@ -761,7 +809,7 @@ Export 実行時点の現在データを、
 
 ## 今後の拡張候補
 
-Phase 1の主要機能、Phase 2のローカルODBC参照・照合検証、およびPhase 3の読取専用権限・異常系検証は完了しています。
+Phase 1の主要機能、Phase 2のローカルODBC参照・照合検証、Phase 3の読取専用権限・異常系検証、およびPhase 4の対象月末基準の期日超過照合とレポート反映まで確認しました。
 
 今後の候補：
 
@@ -769,7 +817,8 @@ Phase 1の主要機能、Phase 2のローカルODBC参照・照合検証、お�
 - CSV 取込履歴の世代管理
 - 取込日時・対象年月の履歴保存
 - `Q_CheckResult` への追加判定統合
-- `Q_PastDueMismatch` の固定基準日を対象年月／照合基準日に基づく仕様へ見直す（既存5件の差異理由も再評価）
+- Phase 4新方式を `Q_CheckResult` など他の画面・Queryに統合するかの参照先確認（旧 `Q_PastDueMismatch` は比較用として維持）
+- 対象月末時点の正確な未払残額を再現するための割当履歴日時・状態スナップショット設計
 - レポートのPDF出力等、運用向け出力機能
 
 ---
@@ -783,6 +832,7 @@ Phase 1の主要機能、Phase 2のローカルODBC参照・照合検証、お�
 | [`docs/03_detail_design.md`](docs/03_detail_design.md) | Endpoint / Service / DTO / VBA / Query / Report の詳細設計、およびPhase 2の実装対応 |
 | [`docs/04_odbc_readonly.md`](docs/04_odbc_readonly.md) | Phase 2のODBC構成、PostgreSQL View/権限、照合SQLと動作確認結果 |
 | [`docs/05_phase3_validation.md`](docs/05_phase3_validation.md) | Phase 3の権限拒否検証、Access異常系、復元記録、エビデンスと課題 |
+| [`docs/06_phase4_pastdue.md`](docs/06_phase4_pastdue.md) | Phase 4の対象月末基準の期日超過判定、SQL、検証結果・制約 |
 
 ---
 
@@ -802,6 +852,7 @@ invoice-access-operations-tool/
    ├─ 03_detail_design.md
    ├─ 04_odbc_readonly.md
    ├─ 05_phase3_validation.md
+   ├─ 06_phase4_pastdue.md
    │
    └─ images/
       ├─ 01-api-login.png
@@ -833,7 +884,12 @@ invoice-access-operations-tool/
        ├─ 27-phase3-status-partial-as-paid.png
        ├─ 28-phase3-cancelled-allocation.png
        ├─ 29-phase3-overdue-before.png
-       └─ 30-phase3-overdue-after.png
+       ├─ 30-phase3-overdue-after.png
+       ├─ 31-phase4-mismatch-initial.png
+       ├─ 32-phase4-monthend-calculation.png
+       ├─ 33-phase4-mismatch-after-boundary-rule.png
+       ├─ 34-phase4-monthly-summary.png
+       └─ 35-phase4-monthly-report.png
 ```
 
 ---
@@ -886,4 +942,4 @@ Access SQL
 VPS / Docker / nginx
 ```
 
-を組み合わせ、既存業務システムに対する **EUC / 月次照合ツールの設計・実装例**としてまとめています。Phase 2では **PostgreSQL参照専用View / ODBCリンクテーブル / 2経路の集計比較**を追加しました。Phase 3では、実装を変更せず**アクセス権限の拒否検証と既存照合クエリの異常系テスト**を実施し、検証手順・結果・制約を文書化しました。
+を組み合わせ、既存業務システムに対する **EUC / 月次照合ツールの設計・実装例**としてまとめています。Phase 2では **PostgreSQL参照専用View / ODBCリンクテーブル / 2経路の集計比較**を追加しました。Phase 3では、実装を変更せず**アクセス権限の拒否検証と既存照合クエリの異常系テスト**を実施しました。Phase 4では、**対象年月末の期限超過候補算出と月次レポートへの連携**を追加し、差異候補の検証結果・制約を文書化しました。
