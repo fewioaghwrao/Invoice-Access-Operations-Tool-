@@ -147,3 +147,10 @@ Phase 2の読取専用設計について、後続のPhase 3でローカルPostgr
 - [`03_detail_design.md`](03_detail_design.md) — View/権限とAccess SQLの詳細
 - [`05_phase3_validation.md`](05_phase3_validation.md) — ローカル権限拒否・既存照合SQLの異常系検証
 - [`../README.md`](../README.md) — 機能・エビデンス概要
+
+
+---
+
+## 13. 後続改善：Phase 4
+
+Phase 3で判明した `Q_PastDueMismatch` の固定基準日問題に対し、Phase 4で対象年月末の計算用Queryと不一致抽出用Queryを追加し、`Q_MonthlySummary` とレポートへ反映した。ODBC側のView・権限構成には変更を加えていない。詳細は [`06_phase4_pastdue.md`](06_phase4_pastdue.md)。

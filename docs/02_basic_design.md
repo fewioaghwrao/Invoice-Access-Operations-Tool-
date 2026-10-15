@@ -1639,3 +1639,68 @@ CSV側に存在する17件について、請求額・割当額・残額を照合
 `Q_PastDueMismatch` は `DueDate < #2026/10/01# AND AllocatedAmount < TotalAmount` で計算している。請求が2026年11月以降のダミーデータでは、`IsOverdue=True` の請求があってもこの基準日による再計算はFalseとなり、**元から5件の不一致**が存在する。Phase 3のテストは5件→6件→5件の差分のみを検証し、既存5件の業務的な異常性まで保証しない。基準日を対象月・評価時点に合わせる仕様は後続検討とする。
 
 試験結果・証跡は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。
+
+---
+
+# 47. Phase 4：期日超過候補の月末基準化 基本設計（2026年10月）
+
+## 47.1 背景と責務
+
+Phase 3までの `Q_PastDueMismatch` は `#2026/10/01#` 固定日付で比較しており、ダミーデータでは初期状態から5件が不一致であった。Phase 4はこの旧Queryを保存しつつ、**対象年月を指定する業務と対応する基準日**に基づいた新Queryに切り替える。
+
+```text
+F_CsvImport / TempVars(TargetYear, TargetMonth)
+    ↓
+Q_InvoiceAllocationSummary（CSVの請求・割当・残額を集計）
+    ↓
+Q_PastDueAsOfMonth（全対象請求の判定・フラグを併記）
+    ↓
+Q_PastDueMismatchAsOfMonth（登録IsOverdueとの不一致候補のみ）
+    ↓
+Q_MonthlySummary.PastDueMismatchCount（DCount）
+    ↓
+R_MonthlyCheck（月次確認レポート）
+```
+
+旧 `Q_PastDueMismatch` は比較・Phase 3の履歴記録として維持する。
+
+## 47.2 判定基準日
+
+```text
+TargetMonthEnd = DateSerial(TargetYear, TargetMonth + 1, 1) - 1
+```
+
+請求の支払期限は日付として扱い、**`DueDate < TargetMonthEnd`** の場合のみ期限を過ぎたとみなす。例えば2027年2月末の場合：
+
+| DueDate | 判定条件 | 結果（未払残額が正の場合） |
+|---|---|---|
+| 2027/02/27 | 2027/02/27 < 2027/02/28 | True |
+| 2027/02/28 | 2027/02/28 < 2027/02/28 | False |
+| 2027/03/01 | 2027/03/01 < 2027/02/28 | False |
+
+AccessのTrue表示値は `-1`、Falseは `0`。
+
+## 47.3 請求と未払判定のフィルタ
+
+- `Q.InvoiceDate < DateSerial(TempVars!TargetYear, TempVars!TargetMonth + 1, 1)` の請求に限定する。
+- `StatusCode = "CANCELLED"` の請求を除外する。
+- `Q.RemainingAmount > 0` かつ `DueDate < TargetMonthEnd` を期限超過候補とする。
+- `Q.IsOverdue` は登録ステータスから得たフラグとして保持し、計算値で上書きしない。
+
+## 47.4 新旧Queryの扱い
+
+| Query / Report | Phase 4での責務 |
+|---|---|
+| `Q_PastDueMismatch` | 旧・固定基準日の比較用に残す（Phase 3の記録と整合） |
+| `Q_PastDueAsOfMonth` | 対象請求17件について算出フラグを併記 |
+| `Q_PastDueMismatchAsOfMonth` | 登録フラグと計算フラグの不一致候補を抽出 |
+| `Q_MonthlySummary` | `DCount("*","Q_PastDueMismatchAsOfMonth")` に切替 |
+| `R_MonthlyCheck` | 既設レコードソースのまま、不一致件数を表示 |
+
+## 47.5 試験・制約
+
+2027年2月のダミーデータで新方式の不一致は3件（InvoiceId 10、12、16）、旧方式は5件。月次サマリー・レポートも3件を表示する。月末当日の比較は開発者が正常と報告したが、該当専用スクリーンショットは提供ZIPに含まれていない。
+
+**対象月末の期日比較**と**その月末時点の正確な残額スナップショット**は異なる。CSVの現在の割当集計では後者を完全には保証できないため、出力は確定済みの未払異常件数ではなく、要確認候補数とする。
+
+実装・SQLと画面エビデンスは [`06_phase4_pastdue.md`](06_phase4_pastdue.md) を参照。

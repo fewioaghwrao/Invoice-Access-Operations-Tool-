@@ -2379,3 +2379,148 @@ WHERE InvoiceId=10 AND IsOverdue=True;
 権限拒否・各検出が期待どおりで、Accessテストデータは復元済み（開発者報告）。正式ACCDBのQuery/VBAやDB元テーブルのデータは本テストでは変更しない。テスト用ACCDBの修正分は公開版へマージしない。
 
 詳細な一覧と証跡の対応は [`05_phase3_validation.md`](05_phase3_validation.md) を参照する。
+
+---
+
+# 73. Phase 4：期日超過判定改善 詳細設計（2026年10月）
+
+## 73.1 変更オブジェクト
+
+| オブジェクト | 区分 | Phase 4変更 |
+|---|---|---|
+| `Q_PastDueMismatch` | 既存 | 変更せず、Phase 3比較用として維持 |
+| `Q_PastDueAsOfMonth` | 新規 | 月末基準日の計算と全対象請求のフラグ併記 |
+| `Q_PastDueMismatchAsOfMonth` | 新規 | 登録 `IsOverdue` と再計算結果の差分抽出 |
+| `Q_MonthlySummary` | 既存 | `PastDueMismatchCount` の参照先を新規差分Queryに変更 |
+| `R_MonthlyCheck` | 既存 | 既存の `Q_MonthlySummary` をレコードソースとして継続 |
+
+## 73.2 期日判定の前提
+
+**期限当日は未超過**とし、以下で評価する。
+
+```text
+TargetMonthEnd = DateSerial(TempVars!TargetYear, TempVars!TargetMonth + 1, 1) - 1
+CalculatedIsOverdue = (DueDate < TargetMonthEnd) AND (RemainingAmount > 0)
+```
+
+ここで `RemainingAmount` は `Q_InvoiceAllocationSummary` がインポートデータから求めた残額であり、過去日時の未払残額を完全に復元した値ではない。
+
+## 73.3 `Q_PastDueAsOfMonth` SQL
+
+以下は今回の会話で提示・修正したSQLを整理した**再現用SQL**である。実際の `.accdb` からQuery定義をエクスポートしたものではないため、Git反映前にAccess SQLビューと照合する。
+
+```sql
+SELECT
+    Q.InvoiceId,
+    Q.MemberId,
+    Q.InvoiceNumber,
+    Q.InvoiceDate,
+    Q.DueDate,
+    Q.TotalAmount,
+    Q.StatusCode,
+    Q.StatusName,
+    Q.IsOverdue,
+    Q.MemberName,
+    Q.AllocatedAmount,
+    Q.RemainingAmount,
+    DateSerial(
+        TempVars!TargetYear,
+        TempVars!TargetMonth + 1,
+        1
+    ) - 1 AS TargetMonthEnd,
+    IIf(
+        Q.DueDate < DateSerial(
+            TempVars!TargetYear,
+            TempVars!TargetMonth + 1,
+            1
+        ) - 1
+        AND Q.RemainingAmount > 0,
+        True,
+        False
+    ) AS CalculatedIsOverdue
+FROM
+    Q_InvoiceAllocationSummary AS Q
+WHERE
+    Q.StatusCode <> "CANCELLED"
+    AND Q.InvoiceDate < DateSerial(
+        TempVars!TargetYear,
+        TempVars!TargetMonth + 1,
+        1
+    )
+ORDER BY
+    Q.InvoiceId;
+```
+
+`TargetMonthEnd` は例として2027年2月なら2027/02/28、`CalculatedIsOverdue=True` はAccessデータシートで通常 `-1` と表示される。
+
+## 73.4 `Q_PastDueMismatchAsOfMonth` SQL
+
+```sql
+SELECT
+    Q.InvoiceId,
+    Q.InvoiceNumber,
+    Q.DueDate,
+    Q.StatusCode,
+    Q.IsOverdue,
+    Q.TotalAmount,
+    Q.AllocatedAmount,
+    Q.RemainingAmount,
+    Q.TargetMonthEnd,
+    Q.CalculatedIsOverdue
+FROM
+    Q_PastDueAsOfMonth AS Q
+WHERE
+    Q.IsOverdue <> Q.CalculatedIsOverdue
+ORDER BY
+    Q.InvoiceId;
+```
+
+2027年2月のサンプルでは3件（InvoiceId=10, 12, 16）が該当した。
+
+## 73.5 `Q_MonthlySummary` の変更点
+
+旧：
+
+```sql
+DCount("*", "Q_PastDueMismatch") AS PastDueMismatchCount
+```
+
+新：
+
+```sql
+DCount("*", "Q_PastDueMismatchAsOfMonth") AS PastDueMismatchCount
+```
+
+その他の集計式・対象月抽出Queryの条件は従来のままとする。変更後の月次サマリー画面では `InvoiceCount=4`, `InvoiceAmount=450000`, `PaymentCount=5`, `PaymentAmount=400000`, `PastDueMismatchCount=3` を確認した。
+
+## 73.6 `R_MonthlyCheck` の対応
+
+既存レポートのレコードソースは `Q_MonthlySummary`。請求・入金の基本集計、および「期限超過状態不整合」の `3件` が2027年2月のレポートに表示されることを確認した。レポート自身の集計式の追加・全面改修は行っていない。
+
+## 73.7 日付境界値テスト
+
+```sql
+SELECT TOP 1
+    DateSerial(2027, 2, 27) < (DateSerial(2027, 3, 1) - 1) AS BeforeMonthEnd,
+    DateSerial(2027, 2, 28) < (DateSerial(2027, 3, 1) - 1) AS OnMonthEnd
+FROM T_InvoiceImport;
+```
+
+期待値：`BeforeMonthEnd=True(-1)`、`OnMonthEnd=False(0)`。**開発者から正常に実行できたとの報告はあるが、今回のエビデンスZIPに境界値単独の画像は含まれない。** 同じ期日が設定された実Invoiceを使ったケースは別検証対象とする。
+
+## 73.8 動作確認と注意事項
+
+| 検証 | 実測 |
+|---|---|
+| `Q_PastDueAsOfMonth` | 17件、2027/02/28基準 |
+| 旧 `Q_PastDueMismatch` | 5件 |
+| 新 `Q_PastDueMismatchAsOfMonth` | 3件（10, 12, 16） |
+| `Q_MonthlySummary` | PastDueMismatchCount=3 |
+| `R_MonthlyCheck` | 期限超過状態不整合=3 |
+
+- 2027年2月の**将来月ダミーデータを2026年10月に用いた検証**。業務上の未来月の実状態を記録したものではない。
+- `IsOverdue` はInvoice側の登録済ステータス由来のフラグで、対象月末における厳密な状態ではない。
+- 検証時の`TempVars!TargetYear`/`TargetMonth`は2027/2に設定済み。未設定時の起動・初期化の詳細検証は未実施。
+- 旧Queryは残るため、`Q_CheckResult`など他の参照箇所が旧Queryを使っていないかの見直しは別課題。
+
+詳細・画像は [`06_phase4_pastdue.md`](06_phase4_pastdue.md) を参照する。
